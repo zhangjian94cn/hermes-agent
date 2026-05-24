@@ -360,6 +360,14 @@ class TestExtractMedia:
         assert "[[audio_as_voice]]" not in cleaned
         assert "[[as_document]]" not in cleaned
 
+    def test_placeholder_absolute_path_media_tag_is_removed_not_attached(self):
+        content = "Here is the screenshot:\nMEDIA:/absolute/path.png"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:" not in cleaned
+        assert "/absolute/path.png" not in cleaned
+        assert "Here is the screenshot" in cleaned
+
 
 class TestMediaDeliveryPathValidation:
     def _patch_roots(self, monkeypatch, *roots):

@@ -94,6 +94,16 @@ class TestBaseDefaultLoop:
         assert a.sent_animations == []
         assert a.sent_files == []
 
+    def test_placeholder_file_url_is_skipped(self):
+        a = _StubAdapter()
+        images = [
+            ("file:///absolute/path.png", "placeholder"),
+            ("https://x.com/a.png", "real"),
+        ]
+        _run(a.send_multiple_images("chat1", images))
+        assert a.sent_files == []
+        assert a.sent_images == [("chat1", "https://x.com/a.png", "real")]
+
 
 # ---------------------------------------------------------------------------
 # Telegram mocks setup (shared with test_send_image_file pattern)

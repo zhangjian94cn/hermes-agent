@@ -154,7 +154,7 @@ _MARKDOWN_HINT_RE = re.compile(
     re.MULTILINE,
 )
 # Detect markdown tables: a line starting with | followed by a separator line.
-# Feishu post-type 'md' elements do not render tables, so we force text mode.
+# Feishu post-type 'md' elements do not render tables.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
@@ -162,6 +162,16 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_INTERACTIVE_CARD_INVALID_RE = re.compile(
+    r"(card|interactive|table|content format|invalid)",
+    re.IGNORECASE,
+)
+_MARKDOWN_TABLE_RENDER_TEXT = "text"
+_MARKDOWN_TABLE_RENDER_CARD = "card_table"
+_MARKDOWN_TABLE_RENDER_MODES = {
+    _MARKDOWN_TABLE_RENDER_TEXT,
+    _MARKDOWN_TABLE_RENDER_CARD,
+}
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -388,6 +398,7 @@ class FeishuAdapterSettings:
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = None
     ws_ping_timeout: Optional[int] = None
+    markdown_table_rendering: str = _MARKDOWN_TABLE_RENDER_TEXT
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -605,6 +616,116 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 
     _flush_current()
     return rows or [[{"tag": "md", "text": content}]]
+
+
+def _parse_markdown_table_row(line: str) -> List[str]:
+    stripped = line.strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return []
+    return [cell.strip() for cell in stripped[1:-1].split("|")]
+
+
+def _is_markdown_table_separator(line: str, expected_columns: Optional[int] = None) -> bool:
+    cells = _parse_markdown_table_row(line)
+    if len(cells) < 2:
+        return False
+    if expected_columns is not None and len(cells) != expected_columns:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def _parse_markdown_table_block(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
+    if len(lines) < 3:
+        return None
+    headers = _parse_markdown_table_row(lines[0])
+    if len(headers) < 2 or not _is_markdown_table_separator(lines[1], len(headers)):
+        return None
+
+    rows: List[Dict[str, str]] = []
+    for raw_line in lines[2:]:
+        cells = _parse_markdown_table_row(raw_line)
+        if not cells:
+            continue
+        normalized = (cells + [""] * len(headers))[: len(headers)]
+        rows.append({f"col_{idx}": value for idx, value in enumerate(normalized)})
+
+    if not rows:
+        return None
+
+    columns = [
+        {
+            "name": f"col_{idx}",
+            "display_name": header or f"Column {idx + 1}",
+            "width": "auto",
+            "field_type": "text",
+        }
+        for idx, header in enumerate(headers)
+    ]
+    return {
+        "tag": "table",
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _build_markdown_table_card_payload(content: str) -> Optional[str]:
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    elements: List[Dict[str, Any]] = []
+    text_buffer: List[str] = []
+    found_table = False
+    in_code_block = False
+    idx = 0
+
+    def _flush_text() -> None:
+        nonlocal text_buffer
+        text = "\n".join(text_buffer).strip()
+        if text:
+            elements.append({"tag": "markdown", "content": text})
+        text_buffer = []
+
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip()
+        if _MARKDOWN_FENCE_OPEN_RE.match(stripped) or _MARKDOWN_FENCE_CLOSE_RE.match(stripped):
+            in_code_block = not in_code_block
+            text_buffer.append(line)
+            idx += 1
+            continue
+
+        if (
+            not in_code_block
+            and idx + 1 < len(lines)
+            and _parse_markdown_table_row(line)
+            and _is_markdown_table_separator(lines[idx + 1], len(_parse_markdown_table_row(line)))
+        ):
+            block_lines = [line, lines[idx + 1]]
+            idx += 2
+            while idx < len(lines) and _parse_markdown_table_row(lines[idx]):
+                block_lines.append(lines[idx])
+                idx += 1
+            table_element = _parse_markdown_table_block(block_lines)
+            if table_element is None:
+                text_buffer.extend(block_lines)
+                continue
+            _flush_text()
+            elements.append(table_element)
+            found_table = True
+            continue
+
+        text_buffer.append(line)
+        idx += 1
+
+    _flush_text()
+    if not found_table or not elements:
+        return None
+
+    return json.dumps(
+        {
+            "config": {"wide_screen_mode": True},
+            "elements": elements,
+        },
+        ensure_ascii=False,
+    )
 
 
 def parse_feishu_post_payload(
@@ -1507,6 +1628,19 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             allow_bots = "none"
 
+        markdown_table_rendering = str(
+            extra.get("markdown_table_rendering")
+            or os.getenv("HERMES_FEISHU_MARKDOWN_TABLE_RENDERING", _MARKDOWN_TABLE_RENDER_TEXT)
+        ).strip().lower()
+        if markdown_table_rendering not in _MARKDOWN_TABLE_RENDER_MODES:
+            logger.warning(
+                "[Feishu] Unknown markdown_table_rendering=%r, falling back to %r. Valid: %s.",
+                markdown_table_rendering,
+                _MARKDOWN_TABLE_RENDER_TEXT,
+                ", ".join(sorted(_MARKDOWN_TABLE_RENDER_MODES)),
+            )
+            markdown_table_rendering = _MARKDOWN_TABLE_RENDER_TEXT
+
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
             app_secret=str(extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
@@ -1560,6 +1694,7 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_reconnect_interval=_coerce_required_int(extra.get("ws_reconnect_interval"), default=120, min_value=1),
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
+            markdown_table_rendering=markdown_table_rendering,
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
@@ -1597,6 +1732,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._markdown_table_rendering = settings.markdown_table_rendering
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
 
@@ -1781,6 +1917,17 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
+                    if msg_type == "interactive" and _INTERACTIVE_CARD_INVALID_RE.search(str(exc)):
+                        logger.warning("[Feishu] Interactive card payload rejected; falling back to plain text")
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": chunk}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                        last_response = response
+                        continue
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
@@ -1801,6 +1948,19 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                if (
+                    msg_type == "interactive"
+                    and not self._response_succeeded(response)
+                    and _INTERACTIVE_CARD_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                ):
+                    logger.warning("[Feishu] Interactive card payload rejected by API response; falling back to plain text")
+                    response = await self._feishu_send_with_retry(
+                        chat_id=chat_id,
+                        msg_type="text",
+                        payload=json.dumps({"text": chunk}, ensure_ascii=False),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -4224,8 +4384,11 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
         if _MARKDOWN_TABLE_RE.search(content):
+            if self._markdown_table_rendering == _MARKDOWN_TABLE_RENDER_CARD:
+                card_payload = _build_markdown_table_card_payload(content)
+                if card_payload:
+                    return "interactive", card_payload
             text_payload = {"text": content}
             return "text", json.dumps(text_payload, ensure_ascii=False)
         if _MARKDOWN_HINT_RE.search(content):

@@ -70,6 +70,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Fast Antigravity control (gated on OpenCLI + Antigravity CDP)
+    "antigravity_opencli",
 ]
 
 
@@ -136,6 +138,16 @@ TOOLSETS = {
             "or keyboard focus. Works with any tool-capable model."
         ),
         "tools": ["computer_use"],
+        "includes": []
+    },
+
+    "antigravity": {
+        "description": (
+            "Fast Google Antigravity control via OpenCLI/CDP. Prefer this "
+            "over generic computer_use for reading, sending, status checks, "
+            "new conversations, model switching, and code extraction."
+        ),
+        "tools": ["antigravity_opencli"],
         "includes": []
     },
 

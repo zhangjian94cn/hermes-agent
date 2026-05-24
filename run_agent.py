@@ -3264,9 +3264,9 @@ class AIAgent:
         messages (for non-vision models) or let the provider adapter handle
         them natively (for vision-capable models).
 
-        Resolution order (see ``agent.image_routing._supports_vision_override``):
+        Resolution order (see ``agent.image_routing._lookup_supports_vision``):
           1. ``model.supports_vision`` (top-level, single-model shortcut)
-          2. ``providers.<provider>.models.<model>.supports_vision``
+          2. ``custom_providers`` / normalized ``providers`` per-model override
           3. models.dev capability lookup
         Custom/local models absent from models.dev would otherwise be
         misclassified as non-vision and have their images stripped.
@@ -3277,7 +3277,8 @@ class AIAgent:
             cfg = load_config()
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
-            return _lookup_supports_vision(provider, model, cfg) is True
+            base_url = (getattr(self, "_base_url", "") or getattr(self, "base_url", "") or "").strip()
+            return _lookup_supports_vision(provider, model, cfg, base_url=base_url) is True
         except Exception:
             return False
 

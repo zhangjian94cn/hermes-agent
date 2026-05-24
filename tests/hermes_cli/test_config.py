@@ -11,6 +11,7 @@ from hermes_cli.config import (
     get_hermes_home,
     ensure_hermes_home,
     get_compatible_custom_providers,
+    get_model_supports_vision_override,
     load_config,
     load_env,
     migrate_config,
@@ -70,6 +71,74 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+
+
+class TestModelVisionOverrides:
+    def test_root_model_supports_vision_override(self):
+        cfg = {
+            "model": {
+                "default": "local-vlm",
+                "base_url": "http://localhost:8317/v1",
+                "supports_vision": True,
+            }
+        }
+        assert get_model_supports_vision_override(
+            "local-vlm",
+            base_url="http://localhost:8317/v1",
+            config=cfg,
+        ) is True
+
+    def test_root_model_supports_vision_false_override(self):
+        cfg = {
+            "model": {
+                "default": "local-vlm",
+                "supports_vision": False,
+            }
+        }
+        assert get_model_supports_vision_override("local-vlm", config=cfg) is False
+
+    def test_custom_provider_per_model_supports_vision_override(self):
+        cfg = {
+            "custom_providers": [
+                {
+                    "name": "local",
+                    "base_url": "http://localhost:8317/v1",
+                    "models": {"local-vlm": {"supports_vision": True}},
+                }
+            ]
+        }
+        assert get_model_supports_vision_override(
+            "local-vlm",
+            base_url="http://localhost:8317/v1",
+            config=cfg,
+        ) is True
+
+    def test_custom_provider_models_preserve_supports_vision_normalization(self):
+        providers = get_compatible_custom_providers({
+            "providers": {
+                "local": {
+                    "base_url": "http://localhost:8317/v1",
+                    "models": {"local-vlm": {"supports_vision": True}},
+                }
+            }
+        })
+        assert providers[0]["models"]["local-vlm"]["supports_vision"] is True
+
+    def test_unknown_model_has_no_override(self):
+        cfg = {
+            "custom_providers": [
+                {
+                    "name": "local",
+                    "base_url": "http://localhost:8317/v1",
+                    "models": {"other-model": {"supports_vision": True}},
+                }
+            ]
+        }
+        assert get_model_supports_vision_override(
+            "local-vlm",
+            base_url="http://localhost:8317/v1",
+            config=cfg,
+        ) is None
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

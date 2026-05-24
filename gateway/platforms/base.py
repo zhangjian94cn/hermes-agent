@@ -1970,6 +1970,9 @@ class BasePlatformAdapter(ABC):
         from urllib.parse import unquote as _unquote
 
         for image_url, alt_text in images:
+            if self._is_placeholder_media_path(image_url):
+                logger.warning("[%s] Skipping placeholder image path: %s", self.name, safe_url_for_log(image_url))
+                continue
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
             try:
@@ -2041,6 +2044,15 @@ class BasePlatformAdapter(ABC):
         """
         return await self.send_image(chat_id=chat_id, image_url=animation_url, caption=caption, reply_to=reply_to, metadata=metadata)
     
+    @staticmethod
+    def _is_placeholder_media_path(path_or_url: str) -> bool:
+        from urllib.parse import unquote as _unquote
+
+        raw = str(path_or_url or "").strip()
+        if raw.startswith("file://"):
+            raw = _unquote(raw[7:])
+        return raw.startswith("/absolute/path")
+
     @staticmethod
     def _is_animation_url(url: str) -> bool:
         """Check if a URL points to an animated GIF (vs a static image)."""
@@ -2270,16 +2282,18 @@ class BasePlatformAdapter(ABC):
         media_pattern = re.compile(
             r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
         )
+        matched_media_tag = False
         for match in media_pattern.finditer(content):
+            matched_media_tag = True
             path = match.group("path").strip()
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
-            if path:
+            if path and not BasePlatformAdapter._is_placeholder_media_path(path):
                 media.append((os.path.expanduser(path), has_voice_tag))
 
         # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
-        if media:
+        if matched_media_tag:
             cleaned = media_pattern.sub('', cleaned)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         

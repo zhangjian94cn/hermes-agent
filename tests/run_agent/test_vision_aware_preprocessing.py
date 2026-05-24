@@ -28,6 +28,7 @@ def _make_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent.provider = "anthropic"
     agent.model = "claude-sonnet-4"
+    agent.base_url = ""
     agent._anthropic_image_fallback_cache = {}
     return agent
 
@@ -153,20 +154,24 @@ class TestModelSupportsVision:
         agent = _make_agent()
         fake_caps = MagicMock()
         fake_caps.supports_vision = True
-        with patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
             assert agent._model_supports_vision() is True
         fake_caps.supports_vision = False
-        with patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
             assert agent._model_supports_vision() is False
 
     def test_none_caps_returns_false(self):
         agent = _make_agent()
-        with patch("agent.models_dev.get_model_capabilities", return_value=None):
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("agent.models_dev.get_model_capabilities", return_value=None):
             assert agent._model_supports_vision() is False
 
     def test_exception_returns_false(self):
         agent = _make_agent()
-        with patch("agent.models_dev.get_model_capabilities", side_effect=RuntimeError("boom")):
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("agent.models_dev.get_model_capabilities", side_effect=RuntimeError("boom")):
             assert agent._model_supports_vision() is False
 
     def test_top_level_model_override_wins(self):
@@ -208,3 +213,55 @@ class TestModelSupportsVision:
         with patch("hermes_cli.config.load_config", return_value={"model": {"supports_vision": False}}), \
              patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
             assert agent._model_supports_vision() is False
+
+    def test_root_model_supports_vision_override_wins(self):
+        agent = _make_agent()
+        agent.provider = "custom"
+        agent.model = "local-vlm"
+        agent.base_url = "http://localhost:8317/v1"
+        cfg = {
+            "model": {
+                "default": "local-vlm",
+                "base_url": "http://localhost:8317/v1",
+                "supports_vision": True,
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.models_dev.get_model_capabilities") as mock_caps:
+            assert agent._model_supports_vision() is True
+        mock_caps.assert_not_called()
+
+    def test_root_model_supports_vision_false_override_wins(self):
+        agent = _make_agent()
+        agent.provider = "anthropic"
+        agent.model = "claude-sonnet-4"
+        cfg = {
+            "model": {
+                "default": "claude-sonnet-4",
+                "supports_vision": False,
+            }
+        }
+        fake_caps = MagicMock()
+        fake_caps.supports_vision = True
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):
+            assert agent._model_supports_vision() is False
+
+    def test_custom_provider_supports_vision_override_wins(self):
+        agent = _make_agent()
+        agent.provider = "custom"
+        agent.model = "local-vlm"
+        agent.base_url = "http://localhost:8317/v1"
+        cfg = {
+            "custom_providers": [
+                {
+                    "name": "local",
+                    "base_url": "http://localhost:8317/v1",
+                    "models": {"local-vlm": {"supports_vision": True}},
+                }
+            ]
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.models_dev.get_model_capabilities") as mock_caps:
+            assert agent._model_supports_vision() is True
+        mock_caps.assert_not_called()

@@ -127,7 +127,7 @@ class ComputerUseBackend(ABC):
 
     # ── Keyboard ────────────────────────────────────────────────────
     @abstractmethod
-    def type_text(self, text: str) -> ActionResult: ...
+    def type_text(self, text: str, element: Optional[int] = None) -> ActionResult: ...
 
     @abstractmethod
     def key(self, keys: str) -> ActionResult:
@@ -143,12 +143,16 @@ class ComputerUseBackend(ABC):
         """Route input to `app` (by name or bundle ID). Default: focus without raise."""
 
     # ── Native-value mutation ────────────────────────────────────────
-    @abstractmethod
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
-        """Set a native value on an element (e.g. AXPopUpButton selection).
+        """Set a native value on an element when the backend supports it.
 
         `element` is the 1-based SOM index returned by a prior capture call.
         """
+        return ActionResult(ok=False, action="set_value", message="set_value is not supported.")
+
+    def health(self) -> Dict[str, Any]:
+        """Return backend diagnostics for preflight checks."""
+        return {"available": self.is_available()}
 
     # ── Timing ──────────────────────────────────────────────────────
     def wait(self, seconds: float) -> ActionResult:

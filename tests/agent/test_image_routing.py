@@ -97,6 +97,52 @@ class TestDecideImageInputMode:
         with patch("agent.image_routing._lookup_supports_vision", return_value=None):
             assert decide_image_input_mode("openrouter", "brand-new-slug", {}) == "text"
 
+    def test_auto_uses_root_supports_vision_override(self):
+        cfg = {
+            "model": {
+                "default": "local-vlm",
+                "base_url": "http://localhost:8317/v1",
+                "supports_vision": True,
+            }
+        }
+        with patch("agent.models_dev.get_model_capabilities") as mock_caps:
+            assert decide_image_input_mode("custom", "local-vlm", cfg) == "native"
+        mock_caps.assert_not_called()
+
+    def test_auto_root_false_override_wins_over_metadata(self):
+        cfg = {
+            "model": {
+                "default": "claude-sonnet-4",
+                "supports_vision": False,
+            }
+        }
+        assert decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "text"
+
+    def test_auto_uses_custom_provider_supports_vision_override(self):
+        cfg = {
+            "model": {
+                "default": "local-vlm",
+                "base_url": "http://localhost:8317/v1",
+            },
+            "custom_providers": [
+                {
+                    "name": "local",
+                    "base_url": "http://localhost:8317/v1",
+                    "models": {"local-vlm": {"supports_vision": True}},
+                }
+            ],
+        }
+        assert decide_image_input_mode("custom", "local-vlm", cfg) == "native"
+
+    def test_unknown_custom_model_stays_text(self):
+        cfg = {
+            "model": {
+                "default": "local-text",
+                "base_url": "http://localhost:8317/v1",
+            }
+        }
+        assert decide_image_input_mode("custom", "local-text", cfg) == "text"
+
     def test_auto_respects_aux_vision_override_even_for_vision_model(self):
         """If the user configured a dedicated vision backend, don't bypass it."""
         cfg = {"auxiliary": {"vision": {"provider": "openrouter", "model": "google/gemini-2.5-flash"}}}

@@ -160,6 +160,83 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    def test_markdown_table_defaults_to_plain_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        msg_type, payload = adapter._build_outbound_payload(
+            "| Col A | Col B |\n| --- | --- |\n| one | two |"
+        )
+
+        self.assertEqual(msg_type, "text")
+        self.assertEqual(json.loads(payload)["text"], "| Col A | Col B |\n| --- | --- |\n| one | two |")
+
+    def test_markdown_table_can_render_as_interactive_card_table(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"markdown_table_rendering": "card_table"}))
+
+        msg_type, payload = adapter._build_outbound_payload(
+            "Before\n| Col A | Col B |\n| --- | --- |\n| one | two |\nAfter"
+        )
+        card = json.loads(payload)
+
+        self.assertEqual(msg_type, "interactive")
+        self.assertEqual([element["tag"] for element in card["elements"]], ["markdown", "table", "markdown"])
+        table = card["elements"][1]
+        self.assertEqual(table["columns"][0]["display_name"], "Col A")
+        self.assertEqual(table["rows"][0]["col_0"], "one")
+        self.assertEqual(table["rows"][0]["col_1"], "two")
+
+    def test_malformed_markdown_table_falls_back_to_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"markdown_table_rendering": "card_table"}))
+
+        msg_type, payload = adapter._build_outbound_payload(
+            "| Col A | Col B |\n| --- | --- |"
+        )
+
+        self.assertEqual(msg_type, "text")
+        self.assertEqual(json.loads(payload)["text"], "| Col A | Col B |\n| --- | --- |")
+
+    def test_non_table_markdown_still_uses_post_payload(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"markdown_table_rendering": "card_table"}))
+
+        msg_type, payload = adapter._build_outbound_payload("**bold** and [link](https://example.com)")
+
+        self.assertEqual(msg_type, "post")
+        self.assertIn("zh_cn", json.loads(payload))
+
+    def test_interactive_card_rejection_falls_back_to_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"markdown_table_rendering": "card_table"}))
+        adapter._client = object()
+        rejected = SimpleNamespace(success=lambda: False, msg="table rows is invalid")
+        accepted = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_1"))
+        adapter._feishu_send_with_retry = AsyncMock(side_effect=[rejected, accepted])
+
+        result = asyncio.run(adapter.send(
+            "oc_chat",
+            "| Col A | Col B |\n| --- | --- |\n| one | two |",
+        ))
+
+        self.assertTrue(result.success)
+        self.assertEqual(adapter._feishu_send_with_retry.await_count, 2)
+        first_call = adapter._feishu_send_with_retry.await_args_list[0].kwargs
+        second_call = adapter._feishu_send_with_retry.await_args_list[1].kwargs
+        self.assertEqual(first_call["msg_type"], "interactive")
+        self.assertEqual(second_call["msg_type"], "text")
+
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",

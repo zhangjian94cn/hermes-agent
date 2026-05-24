@@ -44,6 +44,8 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "wait",
                     "list_apps",
                     "focus_app",
+                    "health",
+                    "doctor",
                 ],
                 "description": (
                     "Which action to perform. `capture` is free (no side "
@@ -69,9 +71,10 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "app": {
                 "type": "string",
                 "description": (
-                    "Optional. Limit capture/action to a specific app "
+                    "Optional. Limit capture/action and follow-up capture to a specific app "
                     "(by name, e.g. 'Safari', or bundle ID, "
-                    "'com.apple.Safari'). If omitted, operates on the "
+                    "'com.apple.Safari'). For click/type/key/set_value/scroll, "
+                    "the backend re-targets this app before acting. If omitted, operates on the "
                     "frontmost app's window or the whole screen."
                 ),
             },
@@ -103,7 +106,8 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "The 1-based SOM index returned by the last "
                     "`capture(mode='som')` call. Strongly preferred over "
-                    "raw coordinates."
+                    "raw coordinates. For action='type', this pre-focuses "
+                    "the target text element before inserting text."
                 ),
             },
             "coordinate": {

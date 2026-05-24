@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    COMPUTER_USE_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -826,6 +827,10 @@ class TestPromptBuilderConstants:
         assert "Feishu" in hint
         assert "MEDIA:" in hint
         assert "Markdown" in hint
+        assert "Markdown subset" in hint
+        assert "card-table renderer" in hint
+        assert "Never infer that a plain text message has an image" in hint
+        assert "never invent paths under ~/.hermes/uploads" in hint
 
     def test_platform_hints_webui(self):
         hint = PLATFORM_HINTS["webui"]
@@ -1189,9 +1194,19 @@ class TestOpenAIModelExecutionGuidance:
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
 
 
+class TestComputerUseGuidance:
+    def test_codex_app_playbook_prevents_target_drift_workarounds(self):
+        text = COMPUTER_USE_GUIDANCE.lower()
+        assert "app='codex'" in text
+        assert "health" in text
+        assert "pbcopy" in text
+        assert "osascript" in text
+        assert "two mutating" in text
+        assert "mcp_permissions" in text
+        assert "usable=true" in text
+        assert "raw `doctor`" in text
+
+
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
-

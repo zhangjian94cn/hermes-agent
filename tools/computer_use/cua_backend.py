@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import Future
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -112,6 +113,19 @@ def _parse_windows_from_text(text: str) -> List[Dict[str, Any]]:
             "off_screen": "[off-screen]" in m.group(0),
         })
     return windows
+
+
+def _clean_app_name(name: str) -> str:
+    return re.sub(r"^-\s+", "", str(name or "").strip())
+
+
+def _matches_app(window: Dict[str, Any], app: str) -> bool:
+    wanted = _clean_app_name(app).lower()
+    if not wanted:
+        return False
+    app_name = _clean_app_name(window.get("app_name", "")).lower()
+    bundle_id = str(window.get("bundle_id", "") or "").lower()
+    return wanted in {app_name, bundle_id} or wanted in app_name or wanted in bundle_id
 
 
 def _parse_elements_from_tree(markdown: str) -> List[UIElement]:
@@ -288,6 +302,20 @@ class _CuaDriverSession:
         self._require_started()
         return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
 
+    async def _list_tools_async(self) -> List[str]:
+        result = await self._session.list_tools()
+        tools = getattr(result, "tools", []) or []
+        names: List[str] = []
+        for tool in tools:
+            name = getattr(tool, "name", None)
+            if name:
+                names.append(str(name))
+        return names
+
+    def list_tools(self, timeout: float = 10.0) -> List[str]:
+        self._require_started()
+        return self._bridge.run(self._list_tools_async(), timeout=timeout)
+
 
 def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
     """Convert an mcp CallToolResult into a plain dict.
@@ -340,10 +368,14 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
+        self._active_app: str = ""
+        self._active_window_title: str = ""
+        self._tool_names: Optional[set[str]] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
         self._session.start()
+        self._refresh_tool_names()
 
     def stop(self) -> None:
         try:
@@ -355,6 +387,137 @@ class CuaDriverBackend(ComputerUseBackend):
         if not _is_macos():
             return False
         return cua_driver_binary_available()
+
+    def _refresh_tool_names(self) -> None:
+        try:
+            self._tool_names = set(self._session.list_tools())
+        except Exception as e:
+            logger.warning("cua-driver tool discovery failed: %s", e)
+            self._tool_names = None
+
+    def _has_tool(self, name: str) -> bool:
+        if self._tool_names is None:
+            self._refresh_tool_names()
+        return self._tool_names is None or name in self._tool_names
+
+    def health(self) -> Dict[str, Any]:
+        version = ""
+        status = ""
+        doctor = ""
+        if cua_driver_binary_available():
+            version = _run_cua_cli(["--version"], timeout=3.0)
+            status = _run_cua_cli(["status"], timeout=3.0)
+            doctor = _run_cua_cli(["doctor"], timeout=8.0)
+        if self._tool_names is None:
+            self._refresh_tool_names()
+        tools = sorted(self._tool_names or [])
+        mcp_permissions = self._probe_mcp_permissions()
+        daemon_smoke = self._probe_daemon_smoke()
+        doctor_probes = _parse_doctor_probes(doctor)
+        diagnosis = _diagnose_health(
+            mcp_permissions=mcp_permissions,
+            daemon_smoke=daemon_smoke,
+            doctor_probes=doctor_probes,
+            tools=tools,
+        )
+        return {
+            "available": self.is_available(),
+            "backend": "cua-driver",
+            "usable": diagnosis["usable"],
+            "permission_status": diagnosis["permission_status"],
+            "summary": diagnosis["summary"],
+            "warnings": diagnosis["warnings"],
+            "command": _CUA_DRIVER_CMD,
+            "version": version.strip(),
+            "status": status.strip(),
+            "mcp_permissions": mcp_permissions,
+            "daemon_smoke": daemon_smoke,
+            "doctor_probes": doctor_probes,
+            "doctor_note": (
+                "Raw `cua-driver doctor` checks the current CLI process. In the "
+                "Hermes gateway it can report TCC denials for Python.app even "
+                "when the CuaDriver.app daemon is authorized. Prefer "
+                "`usable`, `permission_status`, `mcp_permissions`, and "
+                "`daemon_smoke` for control decisions."
+            ),
+            "doctor": doctor.strip(),
+            "tools": tools,
+            "active": {
+                "app": self._active_app,
+                "pid": self._active_pid,
+                "window_id": self._active_window_id,
+                "window_title": self._active_window_title,
+            },
+        }
+
+    def _probe_mcp_permissions(self) -> Dict[str, Any]:
+        if not self._has_tool("check_permissions"):
+            return {
+                "available": False,
+                "ok": None,
+                "accessibility": None,
+                "screen_recording": None,
+                "raw": "check_permissions tool is not available",
+            }
+        try:
+            out = self._session.call_tool("check_permissions", {})
+        except Exception as e:
+            return {
+                "available": True,
+                "ok": False,
+                "accessibility": None,
+                "screen_recording": None,
+                "error": str(e),
+            }
+
+        raw = out["data"] if isinstance(out.get("data"), str) else str(out.get("data", ""))
+        accessibility = _parse_permission_line(raw, "Accessibility")
+        screen_recording = _parse_permission_line(raw, "Screen Recording")
+        known = [v for v in (accessibility, screen_recording) if v is not None]
+        ok = bool(known) and all(known) and not bool(out.get("isError"))
+        return {
+            "available": True,
+            "ok": ok,
+            "accessibility": accessibility,
+            "screen_recording": screen_recording,
+            "raw": raw.strip(),
+        }
+
+    def _probe_daemon_smoke(self) -> Dict[str, Any]:
+        if not self._has_tool("list_windows"):
+            return {
+                "ok": False,
+                "list_windows_ok": False,
+                "window_count": 0,
+                "error": "list_windows tool is not available",
+            }
+        try:
+            out = self._session.call_tool("list_windows", {"on_screen_only": True})
+        except Exception as e:
+            return {
+                "ok": False,
+                "list_windows_ok": False,
+                "window_count": 0,
+                "error": str(e),
+            }
+
+        count = 0
+        sc = out.get("structuredContent") or {}
+        raw_windows = sc.get("windows") if sc else None
+        if raw_windows:
+            count = len(raw_windows)
+        elif isinstance(out.get("data"), str):
+            m = re.search(r"Found\s+(\d+)\s+window", out["data"])
+            if m:
+                count = int(m.group(1))
+            else:
+                count = len(_parse_windows_from_text(out["data"]))
+        ok = not bool(out.get("isError")) and count > 0
+        return {
+            "ok": ok,
+            "list_windows_ok": ok,
+            "window_count": count,
+        }
 
     # ── Capture ────────────────────────────────────────────────────
     def capture(self, mode: str = "som", app: Optional[str] = None) -> CaptureResult:
@@ -399,8 +562,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # `app="Calculator"` legitimately matches no windows on a non-English
         # system and the caller needs to retry with the localized name.
         if app:
-            app_lower = app.lower()
-            filtered = [w for w in windows if app_lower in w["app_name"].lower()]
+            filtered = [w for w in windows if _matches_app(w, app)]
             if not filtered:
                 return CaptureResult(
                     mode=mode, width=0, height=0, png_b64=None,
@@ -419,11 +581,13 @@ class CuaDriverBackend(ComputerUseBackend):
         target = next((w for w in windows if not w["off_screen"]), windows[0])
         self._active_pid = target["pid"]
         self._active_window_id = target["window_id"]
-        app_name = target["app_name"]
+        app_name = _clean_app_name(target["app_name"])
         # Record the resolved app name so capture_after= follow-ups can re-target
         # the same app rather than falling back to the frontmost window.
         if app or not self._last_app:
             self._last_app = app_name
+        self._active_app = app_name
+        self._active_window_title = str(target.get("title", "") or "")
 
         # Step 2: capture.
         png_b64: Optional[str] = None
@@ -461,6 +625,8 @@ class CuaDriverBackend(ComputerUseBackend):
             wt = re.search(r'AXWindow\s+"([^"]+)"', tree)
             if wt:
                 window_title = wt.group(1)
+        if window_title:
+            self._active_window_title = window_title
 
         png_bytes_len = 0
         if png_b64:
@@ -580,12 +746,27 @@ class CuaDriverBackend(ComputerUseBackend):
         return self._action("scroll", args)
 
     # ── Keyboard ───────────────────────────────────────────────────
-    def type_text(self, text: str) -> ActionResult:
+    def type_text(self, text: str, element: Optional[int] = None) -> ActionResult:
         pid = self._active_pid
         if pid is None:
             return ActionResult(ok=False, action="type_text",
                                 message="No active window — call capture() first.")
-        return self._action("type_text", {"pid": pid, "text": text})
+        if self._has_tool("type_text"):
+            args: Dict[str, Any] = {"pid": pid, "text": text}
+            if element is not None:
+                if self._active_window_id is None:
+                    return ActionResult(ok=False, action="type_text",
+                                        message="No active window_id for element_index type.")
+                args["element_index"] = element
+                args["window_id"] = self._active_window_id
+            return self._action("type_text", args)
+        if self._has_tool("type_text_chars"):
+            return self._action("type_text_chars", {"pid": pid, "text": text})
+        return ActionResult(
+            ok=False,
+            action="type_text",
+            message="cua-driver exposes neither type_text nor type_text_chars.",
+        )
 
     def key(self, keys: str) -> ActionResult:
         pid = self._active_pid
@@ -637,7 +818,7 @@ class CuaDriverBackend(ComputerUseBackend):
             for line in data.splitlines():
                 m = re.search(r'(.+?)\s+\(pid\s+(\d+)\)', line)
                 if m:
-                    apps.append({"name": m.group(1).strip(), "pid": int(m.group(2))})
+                    apps.append({"name": _clean_app_name(m.group(1)), "pid": int(m.group(2))})
             return apps
         return []
 
@@ -651,9 +832,16 @@ class CuaDriverBackend(ComputerUseBackend):
         its pid/window_id so that subsequent click/type calls hit the right
         process.
 
-        raise_window=True is intentionally ignored: stealing the user's focus
-        is exactly what this backend is designed to avoid.
+        raise_window=True explicitly asks macOS to activate the app before
+        selecting a window. The default still keeps background routing.
         """
+        if raise_window:
+            raised = _raise_app(app)
+            if not raised:
+                return ActionResult(ok=False, action="focus_app",
+                                    message=f"Could not raise app '{app}'.")
+            time.sleep(0.5)
+
         lw_out = self._session.call_tool("list_windows", {"on_screen_only": True})
         sc = lw_out.get("structuredContent") or {}
         raw_windows = sc.get("windows") if sc else None
@@ -661,6 +849,8 @@ class CuaDriverBackend(ComputerUseBackend):
             windows = [
                 {
                     "app_name": w.get("app_name", ""),
+                    "bundle_id": w.get("bundle_id", ""),
+                    "title": w.get("title", ""),
                     "pid": int(w["pid"]),
                     "window_id": int(w["window_id"]),
                     "z_index": w.get("z_index", 0),
@@ -672,8 +862,7 @@ class CuaDriverBackend(ComputerUseBackend):
             raw_text = lw_out["data"] if isinstance(lw_out["data"], str) else ""
             windows = _parse_windows_from_text(raw_text)
 
-        app_lower = app.lower()
-        matched = [w for w in windows if app_lower in w["app_name"].lower()]
+        matched = [w for w in windows if _matches_app(w, app)]
         # Don't silently fall back to the frontmost window when the filter
         # matches nothing — that hides the real failure (often a localized
         # macOS app name mismatch, e.g. caller passed "Calculator" but
@@ -682,11 +871,14 @@ class CuaDriverBackend(ComputerUseBackend):
         if target:
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
-            self._last_app = target["app_name"]  # preserve for capture_after= follow-ups
+            self._active_app = _clean_app_name(target["app_name"])
+            self._active_window_title = str(target.get("title", "") or "")
+            self._last_app = self._active_app  # preserve for capture_after= follow-ups
             return ActionResult(
                 ok=True, action="focus_app",
-                message=f"Targeted {target['app_name']} (pid {self._active_pid}, "
-                        f"window {self._active_window_id}) without raising window.",
+                message=f"Targeted {self._active_app} (pid {self._active_pid}, "
+                        f"window {self._active_window_id})"
+                        + (" after raising window." if raise_window else " without raising window."),
             )
         return ActionResult(ok=False, action="focus_app",
                             message=f"No on-screen window found for app '{app}'.")
@@ -707,6 +899,122 @@ class CuaDriverBackend(ComputerUseBackend):
             message = data
         return ActionResult(ok=ok, action=name, message=message,
                             meta=data if isinstance(data, dict) else {})
+
+
+def _run_cua_cli(args: List[str], timeout: float) -> str:
+    try:
+        proc = subprocess.run(
+            [_CUA_DRIVER_CMD, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as e:
+        return f"error: {e}"
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    return "\n".join(part for part in (out, err) if part)
+
+
+def _parse_permission_line(text: str, label: str) -> Optional[bool]:
+    needle = label.lower()
+    for line in str(text or "").splitlines():
+        lower = line.lower()
+        if needle not in lower:
+            continue
+        if "denied" in lower or "not granted" in lower or "❌" in line:
+            return False
+        if "granted" in lower or "authorized" in lower or "✅" in line:
+            return True
+    return None
+
+
+def _parse_doctor_probes(doctor: str) -> Dict[str, Optional[bool]]:
+    return {
+        "accessibility": _parse_permission_line(doctor, "Accessibility"),
+        "screen_recording": _parse_permission_line(doctor, "Screen Recording"),
+        "correct_bundle_attribution": _parse_permission_line(doctor, "Correct bundle attribution"),
+        "ax_tree_smoke_test": _parse_permission_line(doctor, "AX tree smoke test"),
+    }
+
+
+def _diagnose_health(
+    *,
+    mcp_permissions: Dict[str, Any],
+    daemon_smoke: Dict[str, Any],
+    doctor_probes: Dict[str, Optional[bool]],
+    tools: List[str],
+) -> Dict[str, Any]:
+    warnings: List[str] = []
+    permissions_ok = mcp_permissions.get("ok") is True
+    daemon_ok = daemon_smoke.get("ok") is True
+    type_tool_ok = "type_text" in tools or "type_text_chars" in tools
+    click_tool_ok = "click" in tools
+
+    raw_doctor_denied = any(
+        value is False
+        for key, value in doctor_probes.items()
+        if key in {"accessibility", "screen_recording", "ax_tree_smoke_test"}
+    )
+    if permissions_ok and raw_doctor_denied:
+        warnings.append("raw_cli_doctor_tcc_mismatch")
+    if permissions_ok and doctor_probes.get("correct_bundle_attribution") is False:
+        warnings.append("raw_cli_doctor_bundle_attribution_warning")
+    if not type_tool_ok:
+        warnings.append("typing_tool_missing")
+    if not click_tool_ok:
+        warnings.append("click_tool_missing")
+
+    usable = permissions_ok and daemon_ok and type_tool_ok and click_tool_ok
+    if usable:
+        permission_status = "ok"
+        summary = (
+            "CuaDriver daemon is usable. MCP check_permissions reports "
+            "Accessibility and Screen Recording granted, daemon list_windows "
+            "works, and click/type tools are available. Do not ask the user to "
+            "re-authorize based only on raw CLI doctor output."
+        )
+    elif mcp_permissions.get("accessibility") is False or mcp_permissions.get("screen_recording") is False:
+        permission_status = "denied"
+        summary = (
+            "CuaDriver daemon reports missing Accessibility or Screen Recording "
+            "permission through MCP check_permissions."
+        )
+    elif not daemon_ok:
+        permission_status = "daemon_unhealthy"
+        summary = "CuaDriver daemon permission probe did not pass list_windows smoke test."
+    elif not type_tool_ok or not click_tool_ok:
+        permission_status = "tool_missing"
+        summary = "CuaDriver daemon is reachable but required click/type tools are missing."
+    else:
+        permission_status = "unknown"
+        summary = "CuaDriver health is inconclusive; inspect mcp_permissions and daemon_smoke."
+
+    return {
+        "usable": usable,
+        "permission_status": permission_status,
+        "summary": summary,
+        "warnings": warnings,
+    }
+
+
+def _raise_app(app: str) -> bool:
+    commands: List[List[str]] = []
+    app = str(app or "").strip()
+    if not app:
+        return False
+    if "." in app and "/" not in app:
+        commands.append(["open", "-b", app])
+    commands.append(["open", "-a", app])
+    for command in commands:
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=3.0, check=False)
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            return True
+    return False
 
 
 def _parse_element(d: Dict[str, Any]) -> UIElement:

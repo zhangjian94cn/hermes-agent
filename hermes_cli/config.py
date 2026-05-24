@@ -3279,6 +3279,120 @@ def get_custom_provider_context_length(
     return None
 
 
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    """Return a boolean for explicit bool-like config values, else ``None``."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _model_name_from_model_config(model_cfg: Any) -> str:
+    """Extract the active model name from a root ``model`` config section."""
+    if isinstance(model_cfg, str):
+        return model_cfg.strip()
+    if not isinstance(model_cfg, dict):
+        return ""
+    for key in ("default", "model"):
+        value = model_cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def get_custom_provider_supports_vision(
+    model: str,
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[bool]:
+    """Look up a per-model ``supports_vision`` override from custom providers."""
+    if not model or not base_url:
+        return None
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            if config is None:
+                return None
+            raw = config.get("custom_providers")
+            custom_providers = raw if isinstance(raw, list) else []
+    if not isinstance(custom_providers, list):
+        return None
+
+    target_url = (base_url or "").rstrip("/")
+    if not target_url:
+        return None
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = (entry.get("base_url") or "").rstrip("/")
+        if not entry_url or entry_url != target_url:
+            continue
+        models = entry.get("models")
+        if not isinstance(models, dict):
+            continue
+        model_cfg = models.get(model)
+        if not isinstance(model_cfg, dict):
+            continue
+        parsed = _coerce_optional_bool(model_cfg.get("supports_vision"))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def get_model_supports_vision_override(
+    model: str,
+    base_url: str = "",
+    config: Optional[Dict[str, Any]] = None,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[bool]:
+    """Return an explicit config override for native image input support.
+
+    Precedence:
+      1. ``model.supports_vision`` when the root model entry applies.
+      2. ``custom_providers[].models.<model>.supports_vision`` for the
+         matching endpoint.
+      3. ``None`` so callers can fall through to models.dev metadata.
+    """
+    if not model:
+        return None
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+    if not isinstance(config, dict):
+        config = {}
+
+    model_cfg = config.get("model")
+    if isinstance(model_cfg, dict):
+        root_override = _coerce_optional_bool(model_cfg.get("supports_vision"))
+        if root_override is not None:
+            configured_model = _model_name_from_model_config(model_cfg)
+            if not configured_model or configured_model == model:
+                configured_base = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+                target_base = str(base_url or "").strip().rstrip("/")
+                if not configured_base or not target_base or configured_base == target_base:
+                    return root_override
+
+    custom_override = get_custom_provider_supports_vision(
+        model,
+        base_url,
+        custom_providers=custom_providers,
+        config=config,
+    )
+    if custom_override is not None:
+        return custom_override
+    return None
+
+
 def check_config_version() -> Tuple[int, int]:
     """
     Check config version.

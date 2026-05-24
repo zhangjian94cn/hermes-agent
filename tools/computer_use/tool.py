@@ -69,7 +69,7 @@ def set_approval_callback(cb) -> None:
 
 
 # Actions that read, not mutate. Always allowed.
-_SAFE_ACTIONS = frozenset({"capture", "wait", "list_apps"})
+_SAFE_ACTIONS = frozenset({"capture", "wait", "list_apps", "health", "doctor"})
 
 # Actions that mutate user-visible state. Go through approval.
 _DESTRUCTIVE_ACTIONS = frozenset({
@@ -154,6 +154,8 @@ def reset_backend_for_tests() -> None:  # pragma: no cover
         _backend = None
     _session_auto_approve = False
     _always_allow = set()
+    with _failure_lock:
+        _failure_state.update({"count": 0, "app": None, "last_action": None, "last_message": None})
 
 
 class _NoopBackend(ComputerUseBackend):  # pragma: no cover
@@ -184,8 +186,8 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         self.calls.append(("scroll", kw))
         return ActionResult(ok=True, action="scroll")
 
-    def type_text(self, text: str) -> ActionResult:
-        self.calls.append(("type", {"text": text}))
+    def type_text(self, text: str, element: Optional[int] = None) -> ActionResult:
+        self.calls.append(("type", {"text": text, "element": element}))
         return ActionResult(ok=True, action="type")
 
     def key(self, keys: str) -> ActionResult:
@@ -203,6 +205,10 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
         self.calls.append(("set_value", {"value": value, "element": element}))
         return ActionResult(ok=True, action="set_value")
+
+    def health(self) -> Dict[str, Any]:
+        self.calls.append(("health", {}))
+        return {"available": True, "backend": "noop"}
 
 
 # ---------------------------------------------------------------------------
@@ -332,14 +338,26 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         apps = backend.list_apps()
         return json.dumps({"apps": apps, "count": len(apps)})
 
+    if action in {"health", "doctor"}:
+        health_fn = getattr(backend, "health", None)
+        if callable(health_fn):
+            data = health_fn()
+        else:
+            data = {"available": backend.is_available()}
+        data.setdefault("action", action)
+        return json.dumps(data)
+
     if action == "focus_app":
         app = args.get("app")
         if not app:
             return json.dumps({"error": "focus_app requires `app`"})
         res = backend.focus_app(app, raise_window=bool(args.get("raise_window")))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _action_response(backend, action, args, res, capture_after, app=app)
 
     if action in {"click", "double_click", "right_click", "middle_click"}:
+        target_error = _retarget_app_if_requested(backend, args)
+        if target_error is not None:
+            return target_error
         button = args.get("button")
         click_count = 1
         if action == "double_click":
@@ -358,9 +376,12 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             x=x, y=y, button=button or "left", click_count=click_count,
             modifiers=args.get("modifiers"),
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _action_response(backend, action, args, res, capture_after)
 
     if action == "drag":
+        target_error = _retarget_app_if_requested(backend, args)
+        if target_error is not None:
+            return target_error
         has_elements = args.get("from_element") is not None and args.get("to_element") is not None
         has_coords = args.get("from_coordinate") and args.get("to_coordinate")
         if not has_elements and not has_coords:
@@ -375,9 +396,12 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             button=args.get("button", "left"),
             modifiers=args.get("modifiers"),
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _action_response(backend, action, args, res, capture_after)
 
     if action == "scroll":
+        target_error = _retarget_app_if_requested(backend, args)
+        if target_error is not None:
+            return target_error
         coord = args.get("coordinate") or (None, None)
         res = backend.scroll(
             direction=args.get("direction", "down"),
@@ -387,22 +411,31 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             y=coord[1] if coord and coord[1] is not None else None,
             modifiers=args.get("modifiers"),
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _action_response(backend, action, args, res, capture_after)
 
     if action == "type":
-        res = backend.type_text(args.get("text", ""))
-        return _maybe_follow_capture(backend, res, capture_after)
+        target_error = _retarget_app_if_requested(backend, args)
+        if target_error is not None:
+            return target_error
+        res = backend.type_text(args.get("text", ""), element=args.get("element"))
+        return _action_response(backend, action, args, res, capture_after)
 
     if action == "key":
+        target_error = _retarget_app_if_requested(backend, args)
+        if target_error is not None:
+            return target_error
         res = backend.key(args.get("keys", ""))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _action_response(backend, action, args, res, capture_after)
 
     if action == "set_value":
+        target_error = _retarget_app_if_requested(backend, args)
+        if target_error is not None:
+            return target_error
         value = args.get("value")
         if value is None:
             return json.dumps({"error": "set_value requires `value`"})
         res = backend.set_value(value=str(value), element=args.get("element"))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _action_response(backend, action, args, res, capture_after)
 
     return json.dumps({"error": f"unknown action {action!r}"})
 
@@ -670,8 +703,73 @@ def _route_capture_through_aux_vision(
     })
 
 
+_failure_lock = threading.Lock()
+_failure_state: Dict[str, Any] = {"count": 0, "app": None, "last_action": None, "last_message": None}
+_MAX_CONSECUTIVE_ACTION_FAILURES = 2
+
+
+def _retarget_app_if_requested(backend: ComputerUseBackend, args: Dict[str, Any]) -> Optional[str]:
+    app = args.get("app")
+    if not app:
+        return None
+    res = backend.focus_app(str(app), raise_window=False)
+    if res.ok:
+        return None
+    return json.dumps({
+        "error": f"target app unavailable: {app}",
+        "action": res.action,
+        "message": res.message,
+        "hint": "Run computer_use with action='health', then capture with the same app before retrying.",
+    })
+
+
+def _record_action_result(action: str, args: Dict[str, Any], res: ActionResult) -> Optional[str]:
+    if action not in _DESTRUCTIVE_ACTIONS:
+        return None
+    app = args.get("app") or ""
+    with _failure_lock:
+        if res.ok:
+            _failure_state.update({"count": 0, "app": None, "last_action": None, "last_message": None})
+            return None
+        same_target = _failure_state.get("app") == app
+        count = int(_failure_state.get("count") or 0) + 1 if same_target else 1
+        _failure_state.update({
+            "count": count,
+            "app": app,
+            "last_action": action,
+            "last_message": res.message,
+        })
+        if count < _MAX_CONSECUTIVE_ACTION_FAILURES:
+            return None
+    return json.dumps({
+        "error": "computer_use aborted after 2 consecutive failed mutating actions",
+        "app": app or None,
+        "action": action,
+        "last_backend_action": res.action,
+        "last_message": res.message,
+        "hint": (
+            "Do not keep trying alternate apps or AppleScript. Run action='health', "
+            "capture the intended app explicitly, then retry with element-based targeting."
+        ),
+    })
+
+
+def _action_response(
+    backend: ComputerUseBackend,
+    action: str,
+    args: Dict[str, Any],
+    res: ActionResult,
+    do_capture: bool,
+    app: Optional[str] = None,
+) -> Any:
+    abort = _record_action_result(action, args, res)
+    if abort is not None:
+        return abort
+    return _maybe_follow_capture(backend, res, do_capture, app=app or args.get("app"))
+
+
 def _maybe_follow_capture(
-    backend: ComputerUseBackend, res: ActionResult, do_capture: bool,
+    backend: ComputerUseBackend, res: ActionResult, do_capture: bool, app: Optional[str] = None,
 ) -> Any:
     if not do_capture:
         return _text_response(res)
@@ -684,7 +782,7 @@ def _maybe_follow_capture(
         # Preserve the app context established by the preceding capture/focus_app so
         # that capture_after=True re-captures the same app rather than the frontmost
         # window (which may have changed if the action caused a focus shift).
-        last_app = getattr(backend, "_last_app", None)
+        last_app = app or getattr(backend, "_last_app", None)
         cap = backend.capture(mode="som", app=last_app)
     except Exception as e:
         logger.warning("follow-up capture failed: %s", e)

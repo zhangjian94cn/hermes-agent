@@ -14,15 +14,16 @@ Two modes:
 
 The decision is made once per message turn by :func:`decide_image_input_mode`.
 It reads ``agent.image_input_mode`` from config.yaml (``auto`` | ``native``
-| ``text``, default ``auto``) and the active model's capability metadata.
+| ``text``, default ``auto``), explicit config capability overrides, and the
+active model's capability metadata.
 
 In ``auto`` mode:
   - If the user has explicitly configured ``auxiliary.vision.provider``
     (i.e. not ``auto`` and not empty), we assume they want the text pipeline
     regardless of the main model — they've opted in to a specific vision
     backend for a reason (cost, quality, local-only, etc.).
-  - Otherwise, if the active model reports ``supports_vision=True`` in its
-    models.dev metadata, we attach natively.
+  - Otherwise, if explicit config or models.dev metadata reports
+    ``supports_vision=True``, we attach natively.
   - Otherwise (non-vision model, no explicit override), we fall back to text.
 
 This keeps ``vision_analyze`` surfaced as a tool in every session — skills
@@ -101,7 +102,9 @@ def _supports_vision_override(
     model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
     top = _coerce_capability_bool(model_cfg.get("supports_vision"))
     if top is not None:
-        return top
+        configured_model = model_cfg.get("default") or model_cfg.get("model")
+        if not configured_model or str(configured_model).strip() == model:
+            return top
 
     # 2. Per-provider, per-model. Named custom providers (e.g. "my-vllm")
     # get rewritten to provider="custom" at runtime
@@ -159,22 +162,48 @@ def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
     return True
 
 
+def _config_model_base_url(cfg: Optional[Dict[str, Any]]) -> str:
+    """Return the configured main-model base URL, if one is available."""
+    if not isinstance(cfg, dict):
+        return ""
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        return ""
+    base_url = model_cfg.get("base_url")
+    if isinstance(base_url, str):
+        return base_url.strip()
+    return ""
+
+
 def _lookup_supports_vision(
     provider: str,
     model: str,
     cfg: Optional[Dict[str, Any]] = None,
+    base_url: str = "",
 ) -> Optional[bool]:
     """Return True/False if we can resolve caps, None if unknown.
 
-    Consults the user's ``supports_vision`` override in config.yaml first
-    (so custom/local models declared as vision-capable don't fall through to
-    text routing in ``auto`` mode), then falls back to models.dev.
+    Consults explicit config capability overrides first, including
+    ``custom_providers`` / normalized ``providers`` entries, then falls back to
+    the legacy provider-name helper and finally models.dev metadata.
     """
+    if not provider or not model:
+        return None
+    try:
+        from hermes_cli.config import get_model_supports_vision_override
+        override = get_model_supports_vision_override(
+            model,
+            base_url=base_url or _config_model_base_url(cfg),
+            config=cfg,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("image_routing: vision override lookup failed for %s:%s — %s", provider, model, exc)
+        override = None
+    if override is not None:
+        return override
     override = _supports_vision_override(cfg, provider, model)
     if override is not None:
         return override
-    if not provider or not model:
-        return None
     try:
         from agent.models_dev import get_model_capabilities
         caps = get_model_capabilities(provider, model)

@@ -69,6 +69,7 @@ class TestSchema:
         assert actions >= {
             "capture", "click", "double_click", "right_click", "middle_click",
             "drag", "scroll", "type", "key", "wait", "list_apps", "focus_app",
+            "health", "doctor",
         }
 
     def test_capture_mode_enum_has_som_vision_ax(self):
@@ -140,6 +141,13 @@ class TestDispatch:
         assert "apps" in parsed
         assert parsed["count"] == 0
 
+    def test_health_returns_backend_diagnostics(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "health"})
+        parsed = json.loads(out)
+        assert parsed["available"] is True
+        assert parsed["backend"] == "noop"
+
     def test_wait_clamps_long_waits(self, noop_backend):
         from tools.computer_use.tool import handle_computer_use
         # The backend's default wait() uses time.sleep with clamping.
@@ -163,6 +171,78 @@ class TestDispatch:
         assert "click" in call_names
         click_kw = next(c[1] for c in noop_backend.calls if c[0] == "click")
         assert click_kw.get("element") == 7
+
+    def test_action_with_app_retargets_before_click(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        handle_computer_use({"action": "click", "app": "Codex", "element": 7})
+        assert noop_backend.calls[0] == ("focus_app", {"app": "Codex", "raise": False})
+        assert noop_backend.calls[1][0] == "click"
+
+    def test_capture_after_preserves_requested_app(self):
+        from tools.computer_use.backend import ActionResult, CaptureResult
+        from tools.computer_use import tool as cu_tool
+
+        class FakeBackend:
+            def __init__(self):
+                self.calls = []
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            def capture(self, mode="som", app=None):
+                self.calls.append(("capture", {"mode": mode, "app": app}))
+                return CaptureResult(mode=mode, width=1, height=1, app=app or "Frontmost")
+            def click(self, **kw): ...
+            def drag(self, **kw): ...
+            def scroll(self, **kw): ...
+            def type_text(self, text, element=None): ...
+            def key(self, keys):
+                self.calls.append(("key", {"keys": keys}))
+                return ActionResult(ok=True, action="hotkey")
+            def list_apps(self): return []
+            def focus_app(self, app, raise_window=False):
+                self.calls.append(("focus_app", {"app": app, "raise": raise_window}))
+                return ActionResult(ok=True, action="focus_app")
+
+        fake = FakeBackend()
+        cu_tool.reset_backend_for_tests()
+        with patch.object(cu_tool, "_get_backend", return_value=fake):
+            out = cu_tool.handle_computer_use({
+                "action": "key",
+                "app": "Codex",
+                "keys": "cmd+v",
+                "capture_after": True,
+            })
+
+        parsed = json.loads(out)
+        assert parsed["app"] == "Codex"
+        assert ("capture", {"mode": "som", "app": "Codex"}) in fake.calls
+
+    def test_two_consecutive_failed_actions_abort(self):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use import tool as cu_tool
+
+        class FailingBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            def capture(self, mode="som", app=None): ...
+            def click(self, **kw):
+                return ActionResult(ok=False, action="click", message="backend failed")
+            def drag(self, **kw): ...
+            def scroll(self, **kw): ...
+            def type_text(self, text, element=None): ...
+            def key(self, keys): ...
+            def list_apps(self): return []
+            def focus_app(self, app, raise_window=False):
+                return ActionResult(ok=True, action="focus_app")
+
+        cu_tool.reset_backend_for_tests()
+        with patch.object(cu_tool, "_get_backend", return_value=FailingBackend()):
+            first = json.loads(cu_tool.handle_computer_use({"action": "click", "app": "Codex", "element": 1}))
+            second = json.loads(cu_tool.handle_computer_use({"action": "click", "app": "Codex", "element": 1}))
+
+        assert first["ok"] is False
+        assert "aborted after 2 consecutive" in second["error"]
 
     def test_double_click_sets_click_count(self, noop_backend):
         from tools.computer_use.tool import handle_computer_use
@@ -319,6 +399,208 @@ class TestSafetyGuards:
         parsed = json.loads(out)
         assert "error" not in parsed
 
+    def test_type_by_element_routes_to_backend(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        handle_computer_use({"action": "type", "text": "hello", "element": 22})
+        type_call = next(c[1] for c in noop_backend.calls if c[0] == "type")
+        assert type_call == {"text": "hello", "element": 22}
+
+
+# ---------------------------------------------------------------------------
+# CuaDriver compatibility shims
+# ---------------------------------------------------------------------------
+
+class TestCuaDriverBackendCompatibility:
+    def test_health_prefers_mcp_permissions_when_cli_doctor_reports_gateway_tcc_denial(self, monkeypatch):
+        from tools.computer_use import cua_backend as cua_backend_module
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend.__new__(CuaDriverBackend)
+        backend._tool_names = {"check_permissions", "click", "list_windows", "type_text"}
+        backend._active_app = ""
+        backend._active_pid = None
+        backend._active_window_id = None
+        backend._active_window_title = ""
+        backend._session = MagicMock()
+
+        def fake_call_tool(name, args):
+            if name == "check_permissions":
+                return {
+                    "data": "✅ Accessibility: granted.\n✅ Screen Recording: granted.",
+                    "isError": False,
+                    "images": [],
+                    "structuredContent": None,
+                }
+            if name == "list_windows":
+                return {
+                    "data": "",
+                    "isError": False,
+                    "images": [],
+                    "structuredContent": {
+                        "windows": [{"app_name": "Codex", "pid": 97100, "window_id": 35860}],
+                    },
+                }
+            raise AssertionError(name)
+
+        def fake_run_cua_cli(args, timeout):
+            if args == ["--version"]:
+                return "0.2.0"
+            if args == ["status"]:
+                return "cua-driver daemon is running"
+            if args == ["doctor"]:
+                return (
+                    "Probes\n"
+                    "  ❌ Accessibility (AXIsProcessTrusted)\n"
+                    "  ❌ Screen Recording (SCShareableContent)\n"
+                    "  ❌ Correct bundle attribution\n"
+                    "  ❌ AX tree smoke test (Finder)\n"
+                )
+            return ""
+
+        backend._session.call_tool.side_effect = fake_call_tool
+        monkeypatch.setattr(cua_backend_module, "cua_driver_binary_available", lambda: True)
+        monkeypatch.setattr(cua_backend_module, "_run_cua_cli", fake_run_cua_cli)
+
+        health = backend.health()
+
+        assert health["usable"] is True
+        assert health["permission_status"] == "ok"
+        assert health["mcp_permissions"]["accessibility"] is True
+        assert health["mcp_permissions"]["screen_recording"] is True
+        assert health["daemon_smoke"]["list_windows_ok"] is True
+        assert health["doctor_probes"]["accessibility"] is False
+        assert "raw_cli_doctor_tcc_mismatch" in health["warnings"]
+        assert "Do not ask the user to re-authorize" in health["summary"]
+
+    def test_health_reports_denied_when_mcp_permissions_are_denied(self, monkeypatch):
+        from tools.computer_use import cua_backend as cua_backend_module
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend.__new__(CuaDriverBackend)
+        backend._tool_names = {"check_permissions", "click", "list_windows", "type_text"}
+        backend._active_app = ""
+        backend._active_pid = None
+        backend._active_window_id = None
+        backend._active_window_title = ""
+        backend._session = MagicMock()
+
+        def fake_call_tool(name, args):
+            if name == "check_permissions":
+                return {
+                    "data": "❌ Accessibility: denied.\n❌ Screen Recording: denied.",
+                    "isError": False,
+                    "images": [],
+                    "structuredContent": None,
+                }
+            if name == "list_windows":
+                return {
+                    "data": "",
+                    "isError": False,
+                    "images": [],
+                    "structuredContent": {
+                        "windows": [{"app_name": "Codex", "pid": 97100, "window_id": 35860}],
+                    },
+                }
+            raise AssertionError(name)
+
+        backend._session.call_tool.side_effect = fake_call_tool
+        monkeypatch.setattr(cua_backend_module, "cua_driver_binary_available", lambda: True)
+        monkeypatch.setattr(cua_backend_module, "_run_cua_cli", lambda args, timeout: "")
+
+        health = backend.health()
+
+        assert health["usable"] is False
+        assert health["permission_status"] == "denied"
+        assert health["mcp_permissions"]["accessibility"] is False
+        assert "MCP check_permissions" in health["summary"]
+
+    def test_type_prefers_type_text_when_available_and_passes_element(self):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend.__new__(CuaDriverBackend)
+        backend._active_pid = 123
+        backend._active_window_id = 456
+        backend._tool_names = {"type_text"}
+        calls = []
+
+        def fake_action(name, args):
+            calls.append((name, args))
+            return ActionResult(ok=True, action=name)
+
+        backend._action = fake_action
+        res = backend.type_text("hello", element=7)
+
+        assert res.ok is True
+        assert calls == [("type_text", {
+            "pid": 123,
+            "text": "hello",
+            "element_index": 7,
+            "window_id": 456,
+        })]
+
+    def test_type_uses_type_text_chars_only_when_type_text_missing(self):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend.__new__(CuaDriverBackend)
+        backend._active_pid = 123
+        backend._active_window_id = 456
+        backend._tool_names = {"type_text_chars"}
+        calls = []
+
+        def fake_action(name, args):
+            calls.append((name, args))
+            return ActionResult(ok=True, action=name)
+
+        backend._action = fake_action
+        res = backend.type_text("hello", element=7)
+
+        assert res.ok is True
+        assert calls == [("type_text_chars", {"pid": 123, "text": "hello"})]
+
+    def test_list_apps_strips_leading_dash_from_text_output(self):
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend.__new__(CuaDriverBackend)
+        backend._session = MagicMock()
+        backend._session.call_tool.return_value = {
+            "data": "- Codex (pid 97100)\n- 夸克 (pid 867)",
+            "isError": False,
+            "structuredContent": None,
+            "images": [],
+        }
+
+        apps = backend.list_apps()
+
+        assert apps == [{"name": "Codex", "pid": 97100}, {"name": "夸克", "pid": 867}]
+
+    def test_focus_app_fails_closed_when_no_window_matches(self):
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend.__new__(CuaDriverBackend)
+        backend._session = MagicMock()
+        backend._session.call_tool.return_value = {
+            "data": "",
+            "isError": False,
+            "images": [],
+            "structuredContent": {
+                "windows": [
+                    {"app_name": "Safari", "pid": 1, "window_id": 2, "z_index": 0},
+                ],
+            },
+        }
+        backend._active_pid = None
+        backend._active_window_id = None
+        backend._active_app = ""
+        backend._active_window_title = ""
+
+        res = backend.focus_app("Codex")
+
+        assert res.ok is False
+        assert "No on-screen window found" in res.message
+        assert backend._active_pid is None
+
 
 # ---------------------------------------------------------------------------
 # Capture → multimodal envelope
@@ -354,7 +636,7 @@ class TestCaptureResponse:
             def click(self, **kw): ...
             def drag(self, **kw): ...
             def scroll(self, **kw): ...
-            def type_text(self, text): ...
+            def type_text(self, text, element=None): ...
             def key(self, keys): ...
             def list_apps(self): return []
             def focus_app(self, app, raise_window=False): ...
@@ -392,7 +674,7 @@ class TestCaptureResponse:
             def click(self, **kw): ...
             def drag(self, **kw): ...
             def scroll(self, **kw): ...
-            def type_text(self, text): ...
+            def type_text(self, text, element=None): ...
             def key(self, keys): ...
             def list_apps(self): return []
             def focus_app(self, app, raise_window=False): ...
@@ -933,6 +1215,35 @@ class TestRunAgentMultimodalHelpers:
         }
 
         with patch.object(agent, "_model_supports_vision", return_value=True):
+            content = agent._tool_result_content_for_active_model("computer_use", result)
+
+        assert content is result["content"]
+        assert any(part.get("type") == "image_url" for part in content)
+
+    def test_computer_use_image_result_preserved_for_custom_vision_override(self):
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent.provider = "custom"
+        agent.model = "local-vlm"
+        agent.base_url = "http://localhost:8317/v1"
+        result = {
+            "_multimodal": True,
+            "content": [
+                {"type": "text", "text": "screen captured"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            ],
+            "text_summary": "screen captured",
+        }
+        cfg = {
+            "model": {
+                "default": "local-vlm",
+                "base_url": "http://localhost:8317/v1",
+                "supports_vision": True,
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=cfg):
             content = agent._tool_result_content_for_active_model("computer_use", result)
 
         assert content is result["content"]
