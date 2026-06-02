@@ -168,6 +168,58 @@ def test_send_existing_conversation_uses_conversation_id(monkeypatch, tmp_path: 
     ]
 
 
+def test_ensure_cdp_invokes_helper_with_restart(monkeypatch, tmp_path: Path):
+    helper = tmp_path / "antigravity-ide-agentapi.py"
+    helper.write_text("# helper\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(antigravity_ide_tool, "_script_path", lambda: helper)
+    monkeypatch.setattr(antigravity_ide_tool, "_python_bin", lambda: "python3")
+
+    def fake_run(command, timeout):
+        calls.append((command, timeout))
+        return _completed(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "action": "ensure_cdp",
+                    "source": "opencli-cdp-ide",
+                    "status": "launched",
+                    "port": 9235,
+                }
+            )
+        )
+
+    monkeypatch.setattr(antigravity_ide_tool, "_run_helper", fake_run)
+
+    result = json.loads(
+        antigravity_ide_tool.handle_antigravity_ide_opencli(
+            {"action": "ensure_cdp", "restart": True, "force": True, "port": 9235, "timeout": 30}
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "launched"
+    assert calls == [
+        (
+            [
+                "python3",
+                str(helper),
+                "ensure-cdp",
+                "--wait",
+                "30",
+                "--format",
+                "json",
+                "--restart",
+                "--force",
+                "--port",
+                "9235",
+            ],
+            35.0,
+        )
+    ]
+
+
 def test_toolset_contains_antigravity_ide_tool():
     from toolsets import TOOLSETS, _HERMES_CORE_TOOLS, resolve_toolset
 

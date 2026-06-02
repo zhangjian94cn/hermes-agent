@@ -36,7 +36,7 @@ DEFAULT_DEVTOOLS_ACTIVE_PORT_FILE = (
     Path.home() / "Library" / "Application Support" / "Claude" / "DevToolsActivePort"
 )
 DEFAULT_PATCHED_APP_PATH = Path.home() / "Applications" / "Claude-CDP.app"
-CLAUDE_APP_CDP_PATCH_VERSION = "4"
+CLAUDE_APP_CDP_PATCH_VERSION = os.getenv("CLAUDE_APP_CDP_PATCH_VERSION", "5")
 PATCH_STAMP_RELATIVE_PATH = Path("Contents/Resources/.opencli-cdp-source.json")
 DEFAULT_WRAPPER_RELATIVE_PATH = (
     "skills/my/ai-tools/hermes-management/scripts/claude-app-opencli.sh"

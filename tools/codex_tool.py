@@ -17,12 +17,14 @@ import shlex
 import shutil
 import subprocess
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from tools.cdp_probe import (
+    normalize_cdp_endpoint as _normalize_cdp_endpoint,
+    probe_codex_cdp_endpoint as _shared_probe_codex_cdp_endpoint,
+)
 from tools.registry import registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
@@ -342,39 +344,12 @@ def _resolve_opencli_command() -> Optional[List[str]]:
     return None
 
 
-def _normalize_cdp_endpoint(value: str) -> str:
-    endpoint = value.strip().rstrip("/")
-    if endpoint.endswith("/json/version"):
-        endpoint = endpoint[: -len("/json/version")]
-    return endpoint
-
-
-def _endpoint_to_version_url(endpoint_or_url: str) -> str:
-    endpoint = _normalize_cdp_endpoint(endpoint_or_url)
-    return f"{endpoint}/json/version"
-
-
-def _endpoint_to_targets_url(endpoint_or_url: str) -> str:
-    endpoint = _normalize_cdp_endpoint(endpoint_or_url)
-    return f"{endpoint}/json/list"
-
-
 def _endpoint_port(endpoint_or_url: str) -> Optional[int]:
     parsed = urllib.parse.urlparse(_normalize_cdp_endpoint(endpoint_or_url))
     try:
         return int(parsed.port) if parsed.port is not None else None
     except ValueError:
         return None
-
-
-def _is_codex_cdp_payload(payload: Any) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    identity = " ".join(
-        str(payload.get(key) or "")
-        for key in ("User-Agent", "Browser", "webSocketDebuggerUrl")
-    ).lower()
-    return "codex" in identity
 
 
 def _read_codex_devtools_endpoint() -> Optional[str]:
@@ -406,90 +381,8 @@ def _candidate_codex_cdp_endpoints() -> List[str]:
     return candidates
 
 
-def _probe_codex_cdp_version_url(url: str, timeout: float) -> Dict[str, Any]:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            raw = response.read(64_000).decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            payload = {"raw": _clip_text(raw, 2_000)}
-        if not _is_codex_cdp_payload(payload):
-            return {
-                "ok": False,
-                "url": url,
-                "error": "CDP endpoint is reachable but does not identify as Codex.",
-                "payload": payload,
-            }
-        return {"ok": True, "url": url, "payload": payload}
-    except (OSError, urllib.error.URLError, TimeoutError) as exc:
-        return {"ok": False, "url": url, "error": str(exc)}
-
-
-def _probe_codex_cdp_targets(endpoint: str, timeout: float) -> Dict[str, Any]:
-    url = _endpoint_to_targets_url(endpoint)
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            raw = response.read(256_000).decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return {"ok": False, "url": url, "error": "CDP target list is not valid JSON.", "raw": _clip_text(raw, 2_000)}
-        if not isinstance(payload, list):
-            return {"ok": False, "url": url, "error": "CDP target list is not an array.", "payload": payload}
-        targets = [
-            item for item in payload
-            if isinstance(item, dict)
-            and item.get("webSocketDebuggerUrl")
-            and item.get("type") in {None, "page", "webview"}
-        ]
-        if not targets:
-            return {
-                "ok": False,
-                "url": url,
-                "error": "No inspectable Codex page targets found at CDP endpoint.",
-                "target_count": len(payload),
-                "targets": _clip_payload(payload, 4_000),
-            }
-        return {
-            "ok": True,
-            "url": url,
-            "target_count": len(payload),
-            "inspectable_count": len(targets),
-            "targets": _clip_payload(targets, 6_000),
-        }
-    except (OSError, urllib.error.URLError, TimeoutError) as exc:
-        return {"ok": False, "url": url, "error": str(exc)}
-
-
 def _probe_codex_cdp_endpoint(endpoint: str, timeout: float) -> Dict[str, Any]:
-    normalized = _normalize_cdp_endpoint(endpoint)
-    version = _probe_codex_cdp_version_url(_endpoint_to_version_url(normalized), timeout=timeout)
-    if not version.get("ok"):
-        return {
-            "ok": False,
-            "endpoint": normalized,
-            "url": version.get("url"),
-            "error": version.get("error", "Codex CDP version probe failed."),
-            "version": version,
-        }
-    targets = _probe_codex_cdp_targets(normalized, timeout=timeout)
-    if not targets.get("ok"):
-        return {
-            "ok": False,
-            "endpoint": normalized,
-            "url": version.get("url"),
-            "error": targets.get("error", "Codex CDP has no inspectable targets."),
-            "version": version,
-            "targets": targets,
-        }
-    return {
-        "ok": True,
-        "endpoint": normalized,
-        "url": version.get("url"),
-        "version": version,
-        "targets": targets,
-    }
+    return _shared_probe_codex_cdp_endpoint(endpoint, timeout=timeout)
 
 
 def _detect_codex_cdp_endpoint() -> Optional[str]:

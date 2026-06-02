@@ -38,8 +38,8 @@ ANTIGRAVITY_IDE_OPENCLI_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["health", "status", "state", "latest", "read", "metadata", "ask", "send", "new", "project_probe"],
-                "description": "IDE operation. ask with new_conversation=true uses IDE CDP when available; send requires an existing conversation_id.",
+                "enum": ["health", "status", "state", "ensure_cdp", "latest", "read", "metadata", "ask", "send", "new", "project_probe"],
+                "description": "IDE operation. ensure_cdp can relaunch the current IDE profile with CDP; ask with new_conversation=true uses IDE CDP when available; send requires an existing conversation_id.",
             },
             "conversation_id": {
                 "type": "string",
@@ -89,6 +89,23 @@ ANTIGRAVITY_IDE_OPENCLI_SCHEMA = {
                 "default": DEFAULT_TIMEOUT_SECONDS,
                 "description": "Maximum seconds for the helper command.",
             },
+            "restart": {
+                "type": "boolean",
+                "default": False,
+                "description": "For action='ensure_cdp', allow quitting and relaunching Antigravity IDE with --remote-debugging-port.",
+            },
+            "force": {
+                "type": "boolean",
+                "default": False,
+                "description": "For action='ensure_cdp', allow terminating the Antigravity IDE Electron process after graceful quit.",
+            },
+            "port": {
+                "type": "integer",
+                "minimum": 1024,
+                "maximum": 65535,
+                "default": 9235,
+                "description": "CDP port for action='ensure_cdp'.",
+            },
         },
         "required": ["action"],
     },
@@ -129,6 +146,7 @@ def _normalize_action(action: Any) -> str:
         "conversations": "latest",
         "conversation": "latest",
         "conversation_list": "latest",
+        "ensure-cdp": "ensure_cdp",
         "project-probe": "project_probe",
     }.get(normalized, normalized)
 
@@ -194,6 +212,23 @@ def _build_helper_command(action: str, args: Dict[str, Any]) -> List[str]:
     base = [_python_bin(), str(script)]
     if action in {"health", "status", "state"}:
         return [*base, action, "--limit", str(_last_value(args)), "--format", "json"]
+    if action == "ensure_cdp":
+        command = [
+            *base,
+            "ensure-cdp",
+            "--wait",
+            str(int(_timeout_value(args))),
+            "--format",
+            "json",
+        ]
+        if args.get("restart"):
+            command.append("--restart")
+        if args.get("force"):
+            command.append("--force")
+        port = args.get("port")
+        if port not in (None, ""):
+            command.extend(["--port", str(port)])
+        return command
     if action == "latest":
         return [*base, "latest", "--limit", str(_last_value(args)), "--format", "json"]
     if action == "read":

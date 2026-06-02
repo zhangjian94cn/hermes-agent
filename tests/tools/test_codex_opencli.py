@@ -4,7 +4,7 @@ import json
 import subprocess
 import urllib.error
 
-from tools import codex_tool
+from tools import cdp_probe, codex_tool
 
 
 class _FakeResponse:
@@ -54,7 +54,7 @@ def test_detect_cdp_endpoint_prefers_devtools_active_port(monkeypatch, tmp_path)
             return _FakeResponse([{"type": "page", "webSocketDebuggerUrl": "ws://codex/page", "url": "app://-/index.html"}])
         raise urllib.error.URLError("refused")
 
-    monkeypatch.setattr(codex_tool.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cdp_probe.urllib.request, "urlopen", fake_urlopen)
 
     assert codex_tool._detect_codex_cdp_endpoint() == "http://127.0.0.1:9222"
     assert requested == [
@@ -77,13 +77,73 @@ def test_detect_cdp_endpoint_probes_known_ports_when_port_file_missing(monkeypat
             return _FakeResponse([{"type": "page", "webSocketDebuggerUrl": "ws://codex/page", "url": "app://-/index.html"}])
         raise urllib.error.URLError("refused")
 
-    monkeypatch.setattr(codex_tool.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cdp_probe.urllib.request, "urlopen", fake_urlopen)
 
     assert codex_tool._detect_codex_cdp_endpoint() == "http://127.0.0.1:9222"
     assert requested == [
         "http://127.0.0.1:9222/json/version",
         "http://127.0.0.1:9222/json/list",
     ]
+
+
+def test_detect_cdp_endpoint_accepts_codex_target_when_version_is_generic(monkeypatch, tmp_path):
+    _clear_cdp_env(monkeypatch)
+    monkeypatch.setenv("CODEX_DEVTOOLS_ACTIVE_PORT_FILE", str(tmp_path / "missing"))
+    requested = []
+
+    def fake_urlopen(url, timeout=1.0):
+        requested.append(url)
+        if url == "http://127.0.0.1:9222/json/version":
+            return _FakeResponse({"Browser": "Chrome/148.0.7778.179", "User-Agent": "Chrome/148 Safari/537.36"})
+        if url == "http://127.0.0.1:9222/json/list":
+            return _FakeResponse(
+                [
+                    {
+                        "type": "page",
+                        "title": "Codex",
+                        "url": "app://-/index.html",
+                        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/test",
+                    }
+                ]
+            )
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr(cdp_probe.urllib.request, "urlopen", fake_urlopen)
+
+    status = codex_tool._probe_codex_cdp_endpoint("http://127.0.0.1:9222", timeout=1.0)
+
+    assert codex_tool._detect_codex_cdp_endpoint() == "http://127.0.0.1:9222"
+    assert status["ok"] is True
+    assert status["identity"] == {"version": False, "target": True, "source": "target"}
+    assert requested[:2] == [
+        "http://127.0.0.1:9222/json/version",
+        "http://127.0.0.1:9222/json/list",
+    ]
+
+
+def test_probe_cdp_endpoint_rejects_generic_chrome_without_codex_target(monkeypatch):
+    def fake_urlopen(url, timeout=1.0):
+        if url == "http://127.0.0.1:9222/json/version":
+            return _FakeResponse({"Browser": "Chrome/148.0.7778.179", "User-Agent": "Chrome/148 Safari/537.36"})
+        if url == "http://127.0.0.1:9222/json/list":
+            return _FakeResponse(
+                [
+                    {
+                        "type": "page",
+                        "title": "Example",
+                        "url": "https://example.com",
+                        "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/test",
+                    }
+                ]
+            )
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr(cdp_probe.urllib.request, "urlopen", fake_urlopen)
+
+    status = codex_tool._probe_codex_cdp_endpoint("http://127.0.0.1:9222", timeout=1.0)
+
+    assert status["ok"] is False
+    assert status["identity"] == {"version": False, "target": False, "source": None}
 
 
 def test_detect_cdp_endpoint_skips_non_codex_9222_and_uses_9238(monkeypatch, tmp_path):
@@ -99,7 +159,7 @@ def test_detect_cdp_endpoint_skips_non_codex_9222_and_uses_9238(monkeypatch, tmp
             return _FakeResponse([{"type": "page", "webSocketDebuggerUrl": "ws://codex/page", "url": "app://-/index.html"}])
         raise urllib.error.URLError("refused")
 
-    monkeypatch.setattr(codex_tool.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cdp_probe.urllib.request, "urlopen", fake_urlopen)
 
     assert codex_tool._detect_codex_cdp_endpoint() == "http://127.0.0.1:9238"
 
@@ -119,7 +179,7 @@ def test_detect_cdp_endpoint_skips_codex_endpoint_without_page_target(monkeypatc
             return _FakeResponse([{"type": "page", "webSocketDebuggerUrl": "ws://codex/page", "url": "app://-/index.html"}])
         raise urllib.error.URLError("refused")
 
-    monkeypatch.setattr(codex_tool.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cdp_probe.urllib.request, "urlopen", fake_urlopen)
 
     assert codex_tool._detect_codex_cdp_endpoint() == "http://127.0.0.1:9238"
 
@@ -154,7 +214,7 @@ def test_detect_cdp_endpoint_uses_hermes_management_config(monkeypatch, tmp_path
             return _FakeResponse([{"type": "page", "webSocketDebuggerUrl": "ws://codex/page", "url": "app://-/index.html"}])
         raise urllib.error.URLError("refused")
 
-    monkeypatch.setattr(codex_tool.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cdp_probe.urllib.request, "urlopen", fake_urlopen)
 
     assert codex_tool._detect_codex_cdp_endpoint() == "http://127.0.0.1:9555"
     assert requested == [
