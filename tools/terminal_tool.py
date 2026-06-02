@@ -1963,6 +1963,119 @@ def terminal_tool(
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
         if not force:
+            # Block app operator shell commands — the model is trying to run
+            # a dedicated Hermes tool as a shell command.  Return a clear
+            # error so the model calls the proper tool instead.
+            _cmd_head = command.strip().split()[0] if command.strip() else ""
+            _cmd_lower = command.lower()
+            _app_op_shell_patterns = {
+                "codex_opencli":            "codex_opencli",
+                "claude_app_opencli":       "claude_app_opencli",
+                "antigravity_opencli":      "antigravity_opencli",
+                "antigravity_ide_opencli":  "antigravity_ide_opencli",
+            }
+            for _pattern, _tool_name in _app_op_shell_patterns.items():
+                if _cmd_head == _pattern or _cmd_lower.startswith(_pattern):
+                    # Auto-redirect: extract the action from the command and
+                    # execute the proper Hermes tool instead of blocking.
+                    _parts = command.strip().split()
+                    _action = "status"  # default
+                    if len(_parts) >= 2:
+                        _action = _parts[1]
+                    logger.info(
+                        "terminal auto-redirect: %s -> %s action=%s",
+                        command[:120], _tool_name, _action)
+                    try:
+                        import importlib as _il
+                        _handler_map = {
+                            "codex_opencli":            ("tools.codex_tool", "handle_codex_opencli"),
+                            "claude_app_opencli":       ("tools.claude_app_tool", "handle_claude_app_opencli"),
+                            "antigravity_opencli":      ("tools.antigravity_tool", "handle_antigravity_opencli"),
+                            "antigravity_ide_opencli":  ("tools.antigravity_ide_tool", "handle_antigravity_ide_opencli"),
+                        }
+                        _mod_name, _fn_name = _handler_map.get(_tool_name, (None, None))
+                        if _mod_name:
+                            _mod = _il.import_module(_mod_name)
+                            _handler = getattr(_mod, _fn_name)
+                            _redirected_result = _handler({"action": _action})
+                            _note = (
+                                f"[Auto-redirected from terminal] The command "
+                                f"``{command.strip()[:80]}`` was intercepted "
+                                f"and executed as ``{_tool_name}`` action=\"{_action}\". "
+                                f"Do NOT run app operator tools as shell commands.\n\n"
+                            )
+                            if isinstance(_redirected_result, str):
+                                return _note + _redirected_result
+                            return _note + json.dumps(_redirected_result)
+                    except Exception as _exc:
+                        logger.warning(
+                            "terminal auto-redirect failed for %s: %s",
+                            _tool_name, _exc)
+                    # Fall through to block on redirect failure
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": -1,
+                        "error": (
+                            f"BLOCKED: ``{_tool_name}`` is NOT a shell command. "
+                            f"It is a Hermes tool. "
+                            f"STOP using terminal. Instead, make a tool call to "
+                            f"``{_tool_name}`` with these exact arguments: "
+                            f"{{\"action\": \"status\"}}"
+                        ),
+                        "status": "blocked",
+                    }, ensure_ascii=False)
+            # Also block opencli <site> shell invocations
+            _opencli_sites = {"codex": "codex_opencli", "claude": "claude_app_opencli",
+                              "antigravity": "antigravity_opencli", "claude-app": "claude_app_opencli"}
+            for _site, _tool_name in _opencli_sites.items():
+                if f"opencli {_site}" in _cmd_lower:
+                    # Auto-redirect opencli invocations
+                    _parts = command.strip().split()
+                    _action = "status"
+                    for _p in _parts[2:]:
+                        if _p in {"status","state","read","send","ask","new",
+                                   "models","model","conversations","wait","stop",
+                                   "health","projects","dump","screenshot"}:
+                            _action = _p
+                            break
+                    logger.info(
+                        "terminal auto-redirect: opencli %s -> %s action=%s",
+                        _site, _tool_name, _action)
+                    try:
+                        _handler_map = {
+                            "codex_opencli": ("tools.codex_tool", "handle_codex_opencli"),
+                            "claude_app_opencli": ("tools.claude_app_tool", "handle_claude_app_opencli"),
+                            "antigravity_opencli": ("tools.antigravity_tool", "handle_antigravity_opencli"),
+                        }
+                        _mod_name, _fn_name = _handler_map.get(_tool_name, (None, None))
+                        if _mod_name:
+                            import importlib as _il2
+                            _mod = _il2.import_module(_mod_name)
+                            _handler = getattr(_mod, _fn_name)
+                            _redirected_result = _handler({"action": _action})
+                            _note = (
+                                f"[Auto-redirected from terminal] The command "
+                                f"``{command.strip()[:80]}`` was intercepted "
+                                f"and executed as ``{_tool_name}`` action=\"{_action}\". "
+                                f"Do NOT run app operator tools as shell commands.\n\n"
+                            )
+                            if isinstance(_redirected_result, str):
+                                return _note + _redirected_result
+                            return _note + json.dumps(_redirected_result)
+                    except Exception as _exc:
+                        logger.warning(
+                            "terminal auto-redirect failed for opencli %s: %s",
+                            _site, _exc)
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": -1,
+                        "error": (
+                            f"``opencli {_site}`` could not be auto-redirected. "
+                            f"Call the ``{_tool_name}`` Hermes tool directly."
+                        ),
+                        "status": "blocked",
+                    }, ensure_ascii=False)
+
             approval = _check_all_guards(command, env_type)
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)

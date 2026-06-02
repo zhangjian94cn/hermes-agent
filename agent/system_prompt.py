@@ -137,6 +137,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         from agent.prompt_builder import COMPUTER_USE_GUIDANCE
         stable_parts.append(COMPUTER_USE_GUIDANCE)
 
+    # App operator routing: tell the model that codex_opencli /
+    # claude_app_opencli / antigravity_opencli are dedicated Hermes
+    # tools, not shell commands to run inside terminal.
+    from agent.prompt_builder import build_app_operator_routing_guidance
+    _app_op_guidance = build_app_operator_routing_guidance(agent.valid_tool_names)
+    if _app_op_guidance:
+        stable_parts.append(_app_op_guidance)
+
     nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
     if nous_subscription_prompt:
         stable_parts.append(nous_subscription_prompt)

@@ -1506,3 +1506,64 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     if not sections:
         return ""
     return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# App Operator Tool Routing Guidance
+# ---------------------------------------------------------------------------
+
+# Tools that control desktop applications via CDP/OpenCLI.
+# Maps tool_name → (display_name, toolset).
+# Any tool listed here that is in the active tool set triggers a routing
+# guidance block telling the model these are NOT shell commands.
+_APP_OPERATOR_ROUTING: list = [
+    ("codex_opencli",            "Codex App",           "codex"),
+    ("claude_app_opencli",       "Claude Desktop App",  "claude-app"),
+    ("antigravity_opencli",      "Antigravity App",     "antigravity"),
+    ("antigravity_ide_opencli",  "Antigravity IDE",     "antigravity-ide"),
+]
+
+
+def build_app_operator_routing_guidance(valid_tool_names: set) -> str:
+    """Return a system-prompt routing guidance block for active app operator tools.
+
+    When app-operator tools (codex_opencli, claude_app_opencli, etc.) are in
+    ``valid_tool_names``, this injects explicit routing guidance telling the
+    model that these are DEDICATED Hermes tools and must not be run as shell
+    commands inside ``terminal``.
+
+    Returns an empty string when no app operator tools are active.
+    """
+    active: list = []
+    for tool_name, display_name, _toolset in _APP_OPERATOR_ROUTING:
+        if tool_name in valid_tool_names:
+            active.append((display_name, tool_name))
+
+    if not active:
+        return ""
+
+    lines = [
+        "## App Operator Tool Routing",
+        "",
+        "The following are DEDICATED Hermes tools for controlling desktop",
+        "applications via CDP/OpenCLI. They are **not shell commands** — never",
+        "attempt to run them inside ``terminal`` as shell commands.",
+        "",
+    ]
+    for display_name, tool_name in active:
+        lines.append(
+            "- **{display}** operations → call ``{tool}`` with the "
+            "``action`` parameter. Example: ``{tool}`` action=``status``".format(
+                display=display_name, tool=tool_name))
+
+    if len(active) > 1:
+        lines.append(
+            "\nIf the user asks about a specific app, use the corresponding "
+            "tool — do not call the wrong app's tool.")
+
+    lines.append(
+        "\nCalling these tool names via ``terminal`` (e.g. ``codex_opencli "
+        "status``) will fail because they are not shell commands. Always use "
+        "the dedicated tool call instead.")
+
+    return "\n".join(lines)

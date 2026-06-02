@@ -1202,6 +1202,100 @@ def handle_claude_app_opencli(args: Dict[str, Any], **_kwargs: Any) -> str:
     return tool_result(result)
 
 
+# ---------------------------------------------------------------------------
+# Structured failure followup guard
+# ---------------------------------------------------------------------------
+
+FOLLOWUP_GUARD_TTL_SECONDS = 90
+
+BLOCKED_STRUCTURED_FALLBACK_TOOLS = {
+    "computer_use",
+    "execute_code",
+    "read_file",
+    "search_files",
+    "terminal",
+}
+
+_STRUCTURED_FAILURE_FOLLOWUP_GUARDS: dict = {}
+
+
+def _guard_key(task_id: str = "", session_id: str = "") -> str:
+    if session_id:
+        return f"session:{session_id}"
+    if task_id:
+        return f"task:{task_id}"
+    return "global"
+
+
+def update_claude_app_opencli_followup_guard(
+    result, *, task_id: str = "", session_id: str = ""
+) -> None:
+    """Set or clear the Claude App followup guard based on the tool result."""
+    try:
+        import json as _json
+        payload = _json.loads(result) if isinstance(result, str) else result
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+
+    key = _guard_key(task_id, session_id)
+    if payload.get("ok") is not False:
+        _STRUCTURED_FAILURE_FOLLOWUP_GUARDS.pop(key, None)
+        return
+
+    should_block = payload.get("fallback_allowed") is False
+    if not should_block:
+        _STRUCTURED_FAILURE_FOLLOWUP_GUARDS.pop(key, None)
+        return
+
+    import time as _time
+    _STRUCTURED_FAILURE_FOLLOWUP_GUARDS[key] = {
+        "created_at": _time.monotonic(),
+        "action": payload.get("action"),
+        "reason": payload.get("reason") or payload.get("error") or "Claude App OpenCLI/CDP error",
+        "next_actions": payload.get("next_actions") or [],
+    }
+
+
+def claude_app_opencli_followup_block_message(
+    function_name: str,
+    *,
+    task_id: str = "",
+    session_id: str = "",
+) -> str | None:
+    """Return a block message if ``function_name`` should be blocked by the
+    Claude App followup guard."""
+    if function_name not in BLOCKED_STRUCTURED_FALLBACK_TOOLS:
+        return None
+
+    key = _guard_key(task_id, session_id)
+    guard = _STRUCTURED_FAILURE_FOLLOWUP_GUARDS.get(key)
+    if guard is None:
+        return None
+
+    import time as _time
+    if _time.monotonic() - guard["created_at"] > FOLLOWUP_GUARD_TTL_SECONDS:
+        _STRUCTURED_FAILURE_FOLLOWUP_GUARDS.pop(key, None)
+        return None
+
+    reason = guard.get("reason") or "a structured Claude App OpenCLI/CDP error"
+    return (
+        "The previous claude_app_opencli call failed with a structured "
+        f"error ({reason}). Do NOT fall back to {function_name}. "
+        "Use claude_app_opencli with one of the suggested next actions "
+        "or retry with different parameters. "
+        "If CDP is broken, call claude_app_opencli action=ensure_cdp first."
+    )
+
+
+def clear_claude_app_opencli_followup_guard(
+    task_id: str = "", session_id: str = ""
+) -> None:
+    key = _guard_key(task_id, session_id)
+    _STRUCTURED_FAILURE_FOLLOWUP_GUARDS.pop(key, None)
+
+
 registry.register(
     name="claude_app_opencli",
     toolset="claude-app",
@@ -1218,5 +1312,8 @@ registry.register(
 __all__ = [
     "CLAUDE_APP_OPENCLI_SCHEMA",
     "check_claude_app_requirements",
+    "claude_app_opencli_followup_block_message",
+    "clear_claude_app_opencli_followup_guard",
     "handle_claude_app_opencli",
+    "update_claude_app_opencli_followup_guard",
 ]

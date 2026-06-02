@@ -641,6 +641,21 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
     # Get toolset definition
     toolset = get_toolset(name)
     if not toolset:
+        # Dynamic registry fallback: tools registered via
+        # `registry.register(toolset="codex", ...)` are discoverable
+        # through get_registered_toolset_names() but may not be in the
+        # static TOOLSETS dict.  Query the registry directly so new
+        # app-operator and plugin toolsets are resolved without
+        # manual additions to TOOLSETS.
+        try:
+            from tools.registry import registry
+            if name in registry.get_registered_toolset_names():
+                tool_names = registry.get_tool_names_for_toolset(name)
+                if tool_names:
+                    return sorted(set(tool_names))
+        except Exception:
+            pass
+
         # Auto-generate a toolset for plugin platforms (hermes-<name>).
         # Gives them _HERMES_CORE_TOOLS plus any tools the plugin registered
         # into a toolset matching the platform name.

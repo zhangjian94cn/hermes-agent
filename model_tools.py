@@ -406,6 +406,25 @@ def _compute_tool_definitions(
     # descriptions that don't actually exist, and hallucinates calls to them.
     available_tool_names = {t["function"]["name"] for t in filtered_tools}
 
+    # Append a dynamic warning to the terminal tool description when app
+    # operator tools (codex_opencli, claude_app_opencli, etc.) are active.
+    # This reinforces Layer 1 (system prompt guidance) at the tool-schema
+    # level so the model sees the warning in the terminal tool itself.
+    _active_app_op_tools = _APP_OPERATOR_TOOL_NAMES & available_tool_names
+    if _active_app_op_tools and "terminal" in available_tool_names:
+        _op_names = ", ".join(f"``{t}``" for t in sorted(_active_app_op_tools))
+        _warning = (
+            "\n\n**App operators active** — the following dedicated Hermes tools "
+            f"are available: {_op_names}. Do NOT attempt to run them as shell "
+            "commands inside this terminal. Use the tool calls directly instead."
+        )
+        for i, td in enumerate(filtered_tools):
+            if td.get("function", {}).get("name") == "terminal":
+                desc = td["function"].get("description", "")
+                if _warning not in desc:
+                    filtered_tools[i]["function"]["description"] = desc + _warning
+                break
+
     # Rebuild execute_code schema to only list sandbox tools that are actually
     # available.  Without this, the model sees "web_search is available in
     # execute_code" even when the API key isn't configured or the toolset is
@@ -799,6 +818,79 @@ def _coerce_boolean(value: str):
     return value
 
 
+# ---------------------------------------------------------------------------
+# App operator followup guard — prevents the model from falling back to
+# terminal / computer_use / execute_code after a structured OpenCLI/CDP
+# failure.  Guards are set inside the tool handler (update_*_guard) and
+# expire after FOLLOWUP_GUARD_TTL_SECONDS (90 s).
+# ---------------------------------------------------------------------------
+
+_APP_OPERATOR_TOOL_NAMES = {
+    "codex_opencli",
+    "claude_app_opencli",
+    "antigravity_opencli",
+    "antigravity_ide_opencli",
+}
+
+
+def _check_app_operator_followup_guards(
+    function_name: str,
+    task_id: str = "",
+    session_id: str = "",
+) -> str | None:
+    """Check all app operator followup guards and return a block message if the
+    model is trying to call a blocked fallback tool."""
+    for module_name, block_fn_name in [
+        ("tools.codex_tool", "codex_opencli_followup_block_message"),
+        ("tools.antigravity_tool", "antigravity_opencli_followup_block_message"),
+        ("tools.claude_app_tool", "claude_app_opencli_followup_block_message"),
+    ]:
+        try:
+            import importlib
+            mod = importlib.import_module(module_name)
+            block_fn = getattr(mod, block_fn_name, None)
+            if block_fn is None:
+                continue
+            msg = block_fn(
+                function_name,
+                task_id=task_id,
+                session_id=session_id,
+            )
+            if msg:
+                return msg
+        except Exception:
+            pass
+    return None
+
+
+def _update_app_operator_followup_guards(
+    function_name: str,
+    result: str,
+    task_id: str = "",
+    session_id: str = "",
+) -> None:
+    """Update the app operator followup guard after a tool execution."""
+    if function_name not in _APP_OPERATOR_TOOL_NAMES:
+        return
+    guard_map = {
+        "codex_opencli":            ("tools.codex_tool", "update_codex_opencli_followup_guard"),
+        "antigravity_opencli":      ("tools.antigravity_tool", "update_antigravity_opencli_followup_guard"),
+        "claude_app_opencli":       ("tools.claude_app_tool", "update_claude_app_opencli_followup_guard"),
+        "antigravity_ide_opencli":  ("tools.antigravity_tool", "update_antigravity_opencli_followup_guard"),
+    }
+    module_name, fn_name = guard_map.get(function_name, (None, None))
+    if module_name is None:
+        return
+    try:
+        import importlib
+        mod = importlib.import_module(module_name)
+        update_fn = getattr(mod, fn_name, None)
+        if update_fn is not None:
+            update_fn(result, task_id=task_id, session_id=session_id)
+    except Exception:
+        pass
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -942,6 +1034,19 @@ def handle_function_call(
             if block_message is not None:
                 return json.dumps({"error": block_message}, ensure_ascii=False)
 
+        # App operator followup guards: prevent the model from falling back
+        # to terminal / computer_use / execute_code after a structured
+        # OpenCLI/CDP failure.  These guards are set by update_*_guard()
+        # inside the tool handlers and persist for FOLLOWUP_GUARD_TTL_SECONDS.
+        if function_name in {"codex_opencli", "claude_app_opencli",
+                             "antigravity_opencli", "antigravity_ide_opencli"}:
+            pass  # these are the tools themselves, not fallbacks
+        else:
+            _guard_msg = _check_app_operator_followup_guards(
+                function_name, task_id=task_id or "", session_id=session_id or "")
+            if _guard_msg is not None:
+                return json.dumps({"error": _guard_msg}, ensure_ascii=False)
+
         # ACP/Zed edit approval runs before any file mutation.  The requester
         # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
         # are unaffected when it is unset.
@@ -986,6 +1091,7 @@ def handle_function_call(
             result = registry.dispatch(
                 function_name, function_args,
                 task_id=task_id,
+                session_id=session_id or "",
                 user_task=user_task,
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
@@ -1029,6 +1135,15 @@ def handle_function_call(
                     break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+        # After every tool execution, update the app operator followup
+        # guards so the model can't fall back to terminal / computer_use
+        # after a structured OpenCLI/CDP failure.
+        _update_app_operator_followup_guards(
+            function_name, result,
+            task_id=task_id or "",
+            session_id=session_id or "",
+        )
 
         return result
 
