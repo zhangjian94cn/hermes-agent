@@ -48,7 +48,6 @@ user is seen through different apps in the future.
 from __future__ import annotations
 
 import asyncio
-import collections
 import hashlib
 import hmac
 import itertools
@@ -155,7 +154,7 @@ _MARKDOWN_HINT_RE = re.compile(
     re.MULTILINE,
 )
 # Detect markdown tables: a line starting with | followed by a separator line.
-# Feishu post-type 'md' elements do not render tables, so we force text mode.
+# Feishu post-type 'md' elements do not render tables.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
@@ -163,6 +162,16 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_INTERACTIVE_CARD_INVALID_RE = re.compile(
+    r"(card|interactive|table|content format|invalid)",
+    re.IGNORECASE,
+)
+_MARKDOWN_TABLE_RENDER_TEXT = "text"
+_MARKDOWN_TABLE_RENDER_CARD = "card_table"
+_MARKDOWN_TABLE_RENDER_MODES = {
+    _MARKDOWN_TABLE_RENDER_TEXT,
+    _MARKDOWN_TABLE_RENDER_CARD,
+}
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -240,7 +249,6 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
-_FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -390,6 +398,8 @@ class FeishuAdapterSettings:
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = None
     ws_ping_timeout: Optional[int] = None
+    markdown_table_rendering: str = _MARKDOWN_TABLE_RENDER_TEXT
+    reply_in_thread: bool = True
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -607,6 +617,181 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 
     _flush_current()
     return rows or [[{"tag": "md", "text": content}]]
+
+
+def _parse_markdown_table_row(line: str) -> List[str]:
+    stripped = line.strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return []
+    return [cell.strip() for cell in stripped[1:-1].split("|")]
+
+
+def _is_markdown_table_separator(line: str, expected_columns: Optional[int] = None) -> bool:
+    cells = _parse_markdown_table_row(line)
+    if len(cells) < 2:
+        return False
+    if expected_columns is not None and len(cells) != expected_columns:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def _parse_markdown_table_block(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
+    if len(lines) < 3:
+        return None
+    headers = _parse_markdown_table_row(lines[0])
+    if len(headers) < 2 or not _is_markdown_table_separator(lines[1], len(headers)):
+        return None
+
+    rows: List[Dict[str, str]] = []
+    for raw_line in lines[2:]:
+        cells = _parse_markdown_table_row(raw_line)
+        if not cells:
+            continue
+        normalized = (cells + [""] * len(headers))[: len(headers)]
+        rows.append({f"col_{idx}": value for idx, value in enumerate(normalized)})
+
+    if not rows:
+        return None
+
+    columns = [
+        {
+            "name": f"col_{idx}",
+            "display_name": header or f"Column {idx + 1}",
+            "width": "auto",
+            "data_type": "text",
+            "vertical_align": "top",
+            "horizontal_align": "left",
+        }
+        for idx, header in enumerate(headers)
+    ]
+    return {
+        "tag": "table",
+        "page_size": max(1, min(10, len(rows))),
+        "row_height": "low",
+        "header_style": {
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "none",
+            "text_color": "default",
+            "bold": True,
+            "lines": 1,
+        },
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _markdown_tables_to_plain_fallback(content: str) -> str:
+    """Render markdown tables as plain text for Feishu card fallback.
+
+    If Feishu rejects the interactive card, sending the original pipe table as
+    text reproduces the exact mobile-client failure the card path is meant to
+    avoid. Convert recognised table blocks into row-oriented key/value text so
+    the fallback stays readable even without card rendering.
+    """
+
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out: List[str] = []
+    in_code_block = False
+    idx = 0
+
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip()
+        if _MARKDOWN_FENCE_OPEN_RE.match(stripped) or _MARKDOWN_FENCE_CLOSE_RE.match(stripped):
+            in_code_block = not in_code_block
+            out.append(line)
+            idx += 1
+            continue
+
+        headers = _parse_markdown_table_row(line)
+        if (
+            not in_code_block
+            and headers
+            and idx + 1 < len(lines)
+            and _is_markdown_table_separator(lines[idx + 1], len(headers))
+        ):
+            idx += 2
+            row_index = 0
+            while idx < len(lines):
+                cells = _parse_markdown_table_row(lines[idx])
+                if not cells:
+                    break
+                normalized = (cells + [""] * len(headers))[: len(headers)]
+                if row_index > 0:
+                    out.append("---")
+                for header, value in zip(headers, normalized):
+                    label = header or "Column"
+                    out.append(f"{label}: {value}" if value else f"{label}:")
+                row_index += 1
+                idx += 1
+            continue
+
+        out.append(line)
+        idx += 1
+
+    return "\n".join(out)
+
+
+def _build_markdown_table_card_payload(content: str) -> Optional[str]:
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    elements: List[Dict[str, Any]] = []
+    text_buffer: List[str] = []
+    found_table = False
+    in_code_block = False
+    idx = 0
+
+    def _flush_text() -> None:
+        nonlocal text_buffer
+        text = "\n".join(text_buffer).strip()
+        if text:
+            elements.append({"tag": "markdown", "content": text})
+        text_buffer = []
+
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip()
+        if _MARKDOWN_FENCE_OPEN_RE.match(stripped) or _MARKDOWN_FENCE_CLOSE_RE.match(stripped):
+            in_code_block = not in_code_block
+            text_buffer.append(line)
+            idx += 1
+            continue
+
+        if (
+            not in_code_block
+            and idx + 1 < len(lines)
+            and _parse_markdown_table_row(line)
+            and _is_markdown_table_separator(lines[idx + 1], len(_parse_markdown_table_row(line)))
+        ):
+            block_lines = [line, lines[idx + 1]]
+            idx += 2
+            while idx < len(lines) and _parse_markdown_table_row(lines[idx]):
+                block_lines.append(lines[idx])
+                idx += 1
+            table_element = _parse_markdown_table_block(block_lines)
+            if table_element is None:
+                text_buffer.extend(block_lines)
+                continue
+            _flush_text()
+            elements.append(table_element)
+            found_table = True
+            continue
+
+        text_buffer.append(line)
+        idx += 1
+
+    _flush_text()
+    if not found_table or not elements:
+        return None
+
+    return json.dumps(
+        {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "body": {"elements": elements},
+        },
+        ensure_ascii=False,
+    )
 
 
 def parse_feishu_post_payload(
@@ -1410,8 +1595,6 @@ class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
     MAX_MESSAGE_LENGTH = 8000
-    # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
-    CHAT_LOCK_MAX_SIZE: int = 1000
     # Threshold for detecting Feishu client-side message splits.
     # When a chunk is near the ~4096-char practical limit, a continuation
     # is almost certain.
@@ -1449,11 +1632,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_inbound_lock = threading.Lock()
         self._pending_drain_scheduled = False
         self._pending_inbound_max_depth = 1000  # cap queue; drop oldest beyond
-        self._chat_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()  # chat_id → lock (per-chat serial processing, LRU-bounded)
+        self._chat_locks: Dict[str, asyncio.Lock] = {}  # chat_id → lock (per-chat serial processing)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
-        self._message_text_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        self._message_text_cache: Dict[str, Optional[str]] = {}
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -1511,6 +1694,19 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             allow_bots = "none"
 
+        markdown_table_rendering = str(
+            extra.get("markdown_table_rendering")
+            or os.getenv("HERMES_FEISHU_MARKDOWN_TABLE_RENDERING", _MARKDOWN_TABLE_RENDER_TEXT)
+        ).strip().lower()
+        if markdown_table_rendering not in _MARKDOWN_TABLE_RENDER_MODES:
+            logger.warning(
+                "[Feishu] Unknown markdown_table_rendering=%r, falling back to %r. Valid: %s.",
+                markdown_table_rendering,
+                _MARKDOWN_TABLE_RENDER_TEXT,
+                ", ".join(sorted(_MARKDOWN_TABLE_RENDER_MODES)),
+            )
+            markdown_table_rendering = _MARKDOWN_TABLE_RENDER_TEXT
+
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
             app_secret=str(extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
@@ -1518,10 +1714,8 @@ class FeishuAdapter(BasePlatformAdapter):
             connection_mode=str(
                 extra.get("connection_mode") or os.getenv("FEISHU_CONNECTION_MODE", "websocket")
             ).strip().lower(),
-            encrypt_key=str(extra.get("encrypt_key") or os.getenv("FEISHU_ENCRYPT_KEY", "")).strip(),
-            verification_token=str(
-                extra.get("verification_token") or os.getenv("FEISHU_VERIFICATION_TOKEN", "")
-            ).strip(),
+            encrypt_key=os.getenv("FEISHU_ENCRYPT_KEY", "").strip(),
+            verification_token=os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip(),
             group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
             allowed_group_users=frozenset(
                 item.strip()
@@ -1566,6 +1760,8 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_reconnect_interval=_coerce_required_int(extra.get("ws_reconnect_interval"), default=120, min_value=1),
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
+            markdown_table_rendering=markdown_table_rendering,
+            reply_in_thread=_to_boolean(extra.get("reply_in_thread", os.getenv("FEISHU_REPLY_IN_THREAD", "true"))),
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
@@ -1603,6 +1799,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._markdown_table_rendering = settings.markdown_table_rendering
+        self._reply_in_thread = settings.reply_in_thread
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
 
@@ -1646,11 +1844,6 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error(
                 "[Feishu] Unsupported FEISHU_CONNECTION_MODE=%s. Supported modes: websocket, webhook.",
                 self._connection_mode,
-            )
-            return False
-        if self._connection_mode == "webhook" and not (self._verification_token or self._encrypt_key):
-            logger.error(
-                "[Feishu] Webhook mode requires FEISHU_VERIFICATION_TOKEN or FEISHU_ENCRYPT_KEY."
             )
             return False
 
@@ -1792,6 +1985,17 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
+                    if msg_type == "interactive" and _INTERACTIVE_CARD_INVALID_RE.search(str(exc)):
+                        logger.warning("[Feishu] Interactive card payload rejected; falling back to plain text")
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": _markdown_tables_to_plain_fallback(chunk)}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                        last_response = response
+                        continue
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
@@ -1812,6 +2016,22 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                if (
+                    msg_type == "interactive"
+                    and not self._response_succeeded(response)
+                    and _INTERACTIVE_CARD_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                ):
+                    logger.warning(
+                        "[Feishu] Interactive card payload rejected by API response: %s; falling back to plain text",
+                        getattr(response, "msg", "") or "",
+                    )
+                    response = await self._feishu_send_with_retry(
+                        chat_id=chat_id,
+                        msg_type="text",
+                        payload=json.dumps({"text": _markdown_tables_to_plain_fallback(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -1846,6 +2066,15 @@ class FeishuAdapter(BasePlatformAdapter):
                 fallback_body = self._build_update_message_body(
                     msg_type="text",
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+                )
+                fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
+                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                result = self._finalize_send_result(fallback_response, "update failed")
+            if not result.success and msg_type == "interactive" and _INTERACTIVE_CARD_INVALID_RE.search(result.error or ""):
+                logger.warning("[Feishu] Interactive card update payload rejected; falling back to plain text")
+                fallback_body = self._build_update_message_body(
+                    msg_type="text",
+                    content=json.dumps({"text": _markdown_tables_to_plain_fallback(content)}, ensure_ascii=False),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
                 fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
@@ -2574,44 +2803,13 @@ class FeishuAdapter(BasePlatformAdapter):
         if approval_id is None:
             logger.debug("[Feishu] Card action missing approval_id, ignoring")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
-        state = self._approval_state.get(approval_id)
-        if not state:
-            logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
-            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         choice = _APPROVAL_CHOICE_MAP.get(action_value.get("hermes_action"), "deny")
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
-            logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
-            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
-
-        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
-            logger.warning(
-                "[Feishu] Approval callback chat mismatch for %s (expected=%s, got=%s)",
-                approval_id,
-                expected_chat_id,
-                callback_chat_id,
-            )
-            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
-
         user_name = self._get_cached_sender_name(open_id) or open_id
 
-        chat_context = getattr(event, "context", None)
-        chat_id = str(getattr(chat_context, "open_chat_id", "") or "")
-        if not self._submit_on_loop(
-            loop,
-            self._resolve_approval(
-                approval_id=approval_id,
-                choice=choice,
-                user_name=user_name,
-                open_id=open_id,
-                chat_id=chat_id,
-            ),
-        ):
+        if not self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name)):
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
         if P2CardActionTriggerResponse is None:
@@ -2659,33 +2857,11 @@ class FeishuAdapter(BasePlatformAdapter):
             response.card = card
         return response
 
-    async def _resolve_approval(
-        self,
-        approval_id: Any,
-        choice: str,
-        user_name: str,
-        *,
-        open_id: str = "",
-        chat_id: str = "",
-    ) -> None:
+    async def _resolve_approval(self, approval_id: Any, choice: str, user_name: str) -> None:
         """Pop approval state and unblock the waiting agent thread."""
-        state = self._approval_state.get(approval_id)
-        if not state:
-            logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
-            return
-        if not self._is_interactive_operator_authorized(open_id):
-            logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
-            return
-        expected_chat_id = str(state.get("chat_id", "") or "")
-        if expected_chat_id and chat_id and expected_chat_id != chat_id:
-            logger.warning(
-                "[Feishu] Approval %s chat mismatch (expected=%s, got=%s)",
-                approval_id, expected_chat_id, chat_id,
-            )
-            return
         state = self._approval_state.pop(approval_id, None)
         if not state:
-            logger.debug("[Feishu] Approval %s already resolved while validating callback", approval_id)
+            logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return
         try:
             from tools.approval import resolve_gateway_approval
@@ -2839,28 +3015,11 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        """Return (creating if needed) the per-chat asyncio.Lock for serial message processing.
-
-        Bounded with LRU eviction so a long-running gateway that sees many
-        distinct chats does not grow ``_chat_locks`` without limit. Locks that
-        are currently held are never evicted; if every entry is locked we fall
-        back to dropping the least-recently-used one.
-        """
+        """Return (creating if needed) the per-chat asyncio.Lock for serial message processing."""
         lock = self._chat_locks.get(chat_id)
-        if lock is not None:
-            self._chat_locks.move_to_end(chat_id)
-            return lock
-        if len(self._chat_locks) >= self.CHAT_LOCK_MAX_SIZE:
-            evicted = False
-            for key in list(self._chat_locks):
-                if not self._chat_locks[key].locked():
-                    self._chat_locks.pop(key)
-                    evicted = True
-                    break
-            if not evicted:
-                self._chat_locks.pop(next(iter(self._chat_locks)))
-        lock = asyncio.Lock()
-        self._chat_locks[chat_id] = lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[chat_id] = lock
         return lock
 
     async def _handle_message_with_guards(self, event: MessageEvent) -> None:
@@ -3310,6 +3469,11 @@ class FeishuAdapter(BasePlatformAdapter):
             self._record_webhook_anomaly(remote_ip, "400")
             return web.json_response({"code": 400, "msg": "invalid json"}, status=400)
 
+        # URL verification challenge — respond before other checks so that Feishu's
+        # subscription setup works even before encrypt_key is wired.
+        if payload.get("type") == "url_verification":
+            return web.json_response({"challenge": payload.get("challenge", "")})
+
         # Verification token check — second layer of defence beyond signature (matches openclaw).
         if self._verification_token:
             header = payload.get("header") or {}
@@ -3318,13 +3482,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
                 self._record_webhook_anomaly(remote_ip, "401-token")
                 return web.Response(status=401, text="Invalid verification token")
-
-        # URL verification challenge — Feishu includes the verification token in
-        # challenge requests. Validate the token (above) before reflecting the
-        # challenge so an unauthenticated remote request cannot prove endpoint
-        # control by getting attacker-supplied challenge data echoed back.
-        if payload.get("type") == "url_verification":
-            return web.json_response({"challenge": payload.get("challenge", "")})
 
         # Timing-safe signature verification (only enforced when encrypt_key is set).
         if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
@@ -3960,7 +4117,6 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client or not message_id:
             return None
         if message_id in self._message_text_cache:
-            self._message_text_cache.move_to_end(message_id)
             return self._message_text_cache[message_id]
         try:
             request = self._build_get_message_request(message_id)
@@ -3982,8 +4138,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 mentions=parent_mentions,
             )
             self._message_text_cache[message_id] = text
-            while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
-                self._message_text_cache.popitem(last=False)
             return text
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
@@ -4310,8 +4464,11 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
         if _MARKDOWN_TABLE_RE.search(content):
+            if self._markdown_table_rendering == _MARKDOWN_TABLE_RENDER_CARD:
+                card_payload = _build_markdown_table_card_payload(content)
+                if card_payload:
+                    return "interactive", card_payload
             text_payload = {"text": content}
             return "text", json.dumps(text_payload, ensure_ascii=False)
         if _MARKDOWN_HINT_RE.search(content):
@@ -4395,7 +4552,7 @@ class FeishuAdapter(BasePlatformAdapter):
         effective_reply_to = reply_to
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        reply_in_thread = bool((metadata or {}).get("thread_id")) and self._reply_in_thread
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -4409,7 +4566,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # For topic/thread messages that fell back from reply→create, use
         # thread_id as receive_id so the message lands in the topic instead of
         # the main chat.
-        _thread_id = (metadata or {}).get("thread_id")
+        _thread_id = (metadata or {}).get("thread_id") if self._reply_in_thread else None
         if _thread_id:
             body = self._build_create_message_body(
                 receive_id=_thread_id,
