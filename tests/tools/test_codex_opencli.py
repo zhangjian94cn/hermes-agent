@@ -4,6 +4,8 @@ import json
 import subprocess
 import urllib.error
 
+import pytest
+
 from tools import cdp_probe, codex_tool
 
 
@@ -36,6 +38,29 @@ def _clear_cdp_env(monkeypatch):
     monkeypatch.delenv("HERMES_MANAGEMENT_CONFIG", raising=False)
     monkeypatch.delenv("OPENCLI_CDP_ENDPOINT", raising=False)
     monkeypatch.delenv("CODEX_DEVTOOLS_ACTIVE_PORT_FILE", raising=False)
+
+
+def _healthy_opencli_runtime():
+    return {
+        "ok": True,
+        "repo": "/repo/community-opencli",
+        "node": "/usr/bin/node",
+        "package_json_exists": True,
+        "main": "/repo/community-opencli/dist/src/main.js",
+        "main_exists": True,
+        "commander_package": "/repo/community-opencli/node_modules/commander/package.json",
+        "commander_exists": True,
+        "version_probe": {"ok": True, "stdout": "1.8.1"},
+        "missing": [],
+        "repair_command": "bash /repo/skills/my/ai-tools/hermes-management/scripts/ensure-hermes-runtime-env.sh --repair",
+    }
+
+
+@pytest.fixture(autouse=True)
+def _default_opencli_runtime(monkeypatch):
+    monkeypatch.setattr(codex_tool, "_local_opencli_runtime_status", _healthy_opencli_runtime)
+    monkeypatch.delenv("HERMES_CODEX_OPENCLI", raising=False)
+    monkeypatch.delenv("HERMES_OPENCLI_BIN", raising=False)
 
 
 def test_detect_cdp_endpoint_prefers_devtools_active_port(monkeypatch, tmp_path):
@@ -241,6 +266,27 @@ def test_health_reports_opencli_and_cdp(monkeypatch):
     assert result["fallback"] is None
 
 
+def test_high_level_action_reports_missing_opencli_runtime(monkeypatch):
+    missing_runtime = _healthy_opencli_runtime()
+    missing_runtime.update(
+        {
+            "ok": False,
+            "commander_exists": False,
+            "missing": ["/repo/community-opencli/node_modules/commander/package.json"],
+        }
+    )
+    monkeypatch.setattr(codex_tool, "_local_opencli_runtime_status", lambda: missing_runtime)
+
+    result = json.loads(codex_tool.handle_codex_opencli({"action": "state"}))
+
+    assert result["ok"] is False
+    assert result["opencli_runtime"]["commander_exists"] is False
+    assert result["fallback_allowed"] is False
+    assert result["do_not_use_computer_use"] is True
+    assert result["next_actions"][0]["action"] == "repair_runtime"
+    assert "ensure-hermes-runtime-env.sh --repair" in result["next_actions"][0]["command"]
+
+
 def test_health_with_cdp_down_keeps_tool_on_ensure_cdp_path(monkeypatch):
     monkeypatch.setattr(codex_tool, "_resolve_opencli_command", lambda: ["opencli"])
     monkeypatch.setattr(codex_tool, "_cdp_status", lambda timeout=1.5: {"ok": False, "error": "no target"})
@@ -268,7 +314,23 @@ def test_ensure_cdp_reports_existing_endpoint(monkeypatch):
     assert result["launched"] is False
 
 
-def test_ensure_cdp_launches_side_by_side_instance(monkeypatch):
+def test_ensure_cdp_does_not_launch_without_allow_launch(monkeypatch):
+    monkeypatch.setattr(codex_tool, "_cdp_status", lambda timeout=1.5: {"ok": False, "error": "connection refused"})
+
+    def fail_launch(_port):
+        raise AssertionError("ensure_cdp must not launch Codex by default")
+
+    monkeypatch.setattr(codex_tool, "_launch_codex_cdp", fail_launch)
+
+    result = json.loads(codex_tool.handle_codex_opencli({"action": "ensure_cdp", "port": 9555}))
+
+    assert result["ok"] is False
+    assert result["status"] == "launch_not_allowed"
+    assert result["launched"] is False
+    assert result["fallback_allowed"] is False
+
+
+def test_ensure_cdp_launches_side_by_side_instance_when_allowed(monkeypatch):
     launches = []
     monkeypatch.setattr(codex_tool, "_cdp_status", lambda timeout=1.5: {"ok": False, "error": "connection refused"})
 
@@ -287,7 +349,11 @@ def test_ensure_cdp_launches_side_by_side_instance(monkeypatch):
         },
     )
 
-    result = json.loads(codex_tool.handle_codex_opencli({"action": "ensure_cdp", "port": 9555}))
+    result = json.loads(
+        codex_tool.handle_codex_opencli(
+            {"action": "ensure_cdp", "port": 9555, "allow_launch": True}
+        )
+    )
 
     assert result["ok"] is True
     assert result["status"] == "launched"
@@ -333,7 +399,11 @@ def test_ensure_cdp_uses_configured_default_port(monkeypatch, tmp_path):
         },
     )
 
-    result = json.loads(codex_tool.handle_codex_opencli({"action": "ensure_cdp"}))
+    result = json.loads(
+        codex_tool.handle_codex_opencli(
+            {"action": "ensure_cdp", "allow_launch": True}
+        )
+    )
 
     assert result["ok"] is True
     assert result["port"] == 9555
@@ -369,7 +439,11 @@ def test_ensure_cdp_force_new_skips_existing_endpoint_port(monkeypatch):
     monkeypatch.setattr(codex_tool, "_launch_codex_cdp", fake_launch)
     monkeypatch.setattr(codex_tool, "_wait_for_codex_cdp", fake_wait)
 
-    result = json.loads(codex_tool.handle_codex_opencli({"action": "ensure_cdp", "force_new": True}))
+    result = json.loads(
+        codex_tool.handle_codex_opencli(
+            {"action": "ensure_cdp", "force_new": True, "allow_launch": True}
+        )
+    )
 
     assert result["ok"] is True
     assert result["status"] == "launched"
@@ -395,10 +469,24 @@ def test_cdp_unavailable_routes_to_ensure_cdp_before_fallback(monkeypatch):
     assert result["fallback_allowed"] is False
     assert result["fallback"] is None
     assert result["do_not_use_computer_use"] is True
-    assert result["next_actions"][0]["action"] == "ensure_cdp"
+    assert [item["action"] for item in result["next_actions"][:2]] == ["health", "ensure_cdp"]
 
 
-def test_high_level_action_auto_ensures_cdp_before_opencli(monkeypatch):
+def test_high_level_action_does_not_auto_ensure_cdp_by_default(monkeypatch):
+    ensure_calls = []
+    monkeypatch.setattr(codex_tool, "_resolve_opencli_command", lambda: ["opencli"])
+    monkeypatch.setattr(codex_tool, "_cdp_status", lambda timeout=1.5: {"ok": False, "error": "connection refused"})
+    monkeypatch.setattr(codex_tool, "_ensure_cdp_payload", lambda args: ensure_calls.append(args) or {"ok": True})
+
+    result = json.loads(codex_tool.handle_codex_opencli({"action": "state", "timeout": 5}))
+
+    assert result["ok"] is False
+    assert result["action"] == "state"
+    assert "auto_ensure_cdp" not in result
+    assert ensure_calls == []
+
+
+def test_high_level_action_auto_ensures_cdp_before_opencli_when_allowed(monkeypatch):
     calls = []
     monkeypatch.setattr(codex_tool, "_resolve_opencli_command", lambda: ["opencli"])
     monkeypatch.setattr(codex_tool, "_cdp_status", lambda timeout=1.5: {"ok": False, "error": "connection refused"})
@@ -420,7 +508,16 @@ def test_high_level_action_auto_ensures_cdp_before_opencli(monkeypatch):
 
     monkeypatch.setattr(codex_tool, "_run_opencli", fake_run)
 
-    result = json.loads(codex_tool.handle_codex_opencli({"action": "state", "timeout": 5}))
+    result = json.loads(
+        codex_tool.handle_codex_opencli(
+            {
+                "action": "state",
+                "timeout": 5,
+                "auto_ensure_cdp": True,
+                "allow_launch": True,
+            }
+        )
+    )
 
     assert result["ok"] is True
     assert result["action"] == "state"
@@ -443,7 +540,15 @@ def test_high_level_action_reports_auto_ensure_failure(monkeypatch):
         },
     )
 
-    result = json.loads(codex_tool.handle_codex_opencli({"action": "state"}))
+    result = json.loads(
+        codex_tool.handle_codex_opencli(
+            {
+                "action": "state",
+                "auto_ensure_cdp": True,
+                "allow_launch": True,
+            }
+        )
+    )
 
     assert result["ok"] is False
     assert result["action"] == "state"
@@ -956,8 +1061,10 @@ def test_parse_json_payload_skips_non_json_prefix():
 
 
 def test_toolset_contains_fast_codex_tool():
-    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS, resolve_toolset
+    from toolsets import resolve_toolset, validate_toolset
+    from tools.registry import registry
 
-    assert "codex_opencli" in _HERMES_CORE_TOOLS
-    assert TOOLSETS["codex"]["tools"] == ["codex_opencli"]
+    assert registry.get_entry("codex_opencli") is not None
+    assert registry.is_toolset_available("codex") is True
+    assert validate_toolset("codex") is True
     assert resolve_toolset("codex") == ["codex_opencli"]

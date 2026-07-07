@@ -57,7 +57,9 @@ CODEX_OPENCLI_SCHEMA = {
         "or manage Codex App conversations. Fall back to computer_use only "
         "when this tool explicitly returns fallback_allowed=true because "
         "OpenCLI is unavailable or the requested action is unsupported. "
-        "When CDP is unavailable, call action='ensure_cdp' first. "
+        "When CDP is unavailable, report the structured unavailable state. "
+        "action='ensure_cdp' is read-only unless allow_launch=true or "
+        "restart=true is explicitly provided. "
         "If an action returns ok=false with fallback_allowed=false or "
         "do_not_use_computer_use=true, do not call computer_use; use another "
         "codex_opencli action such as state/models/wait/stop or report the "
@@ -91,8 +93,10 @@ CODEX_OPENCLI_SCHEMA = {
                 ],
                 "description": (
                     "Codex App operation to run through OpenCLI/CDP. Use "
-                    "ensure_cdp to start a CDP-enabled Codex instance before "
-                    "projects/conversations for conversation lists and ask "
+                    "health/status for read-only checks. Use ensure_cdp for "
+                    "CDP recovery only with allow_launch=true or restart=true "
+                    "after explicit user permission. Use projects/conversations "
+                    "for conversation lists and ask "
                     "for one-shot tasks. Do not use dump for ordinary user "
                     "requests; dump is diagnostic-only."
                 ),
@@ -173,6 +177,15 @@ CODEX_OPENCLI_SCHEMA = {
                 "maximum": 65535,
                 "description": "Override the configured preferred CDP port when action='ensure_cdp'.",
             },
+            "allow_launch": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "For action='ensure_cdp', explicitly allow launching a "
+                    "CDP-enabled Codex instance. Defaults to false because "
+                    "launching Codex can interrupt or confuse active user tasks."
+                ),
+            },
             "restart": {
                 "type": "boolean",
                 "default": False,
@@ -204,11 +217,13 @@ CODEX_OPENCLI_SCHEMA = {
             },
             "auto_ensure_cdp": {
                 "type": "boolean",
-                "default": True,
+                "default": False,
                 "description": (
-                    "For high-level actions, automatically launch/recover a "
-                    "CDP-enabled Codex instance before running the requested "
-                    "operation when CDP is unavailable or has no inspectable target."
+                    "For high-level actions, automatically attempt CDP recovery "
+                    "before running the requested operation when CDP is "
+                    "unavailable. Defaults to false. Recovery still will not "
+                    "launch Codex unless allow_launch=true or restart=true is "
+                    "explicitly provided."
                 ),
             },
             "diagnostic": {
@@ -227,6 +242,76 @@ CODEX_OPENCLI_SCHEMA = {
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _opencli_repo() -> Path:
+    return _repo_root() / "community-opencli"
+
+
+def _runtime_repair_command() -> str:
+    script = (
+        _repo_root().parent
+        / "skills"
+        / "my"
+        / "ai-tools"
+        / "hermes-management"
+        / "scripts"
+        / "ensure-hermes-runtime-env.sh"
+    )
+    return f"bash {shlex.quote(str(script))} --repair"
+
+
+def _local_opencli_runtime_status() -> Dict[str, Any]:
+    repo = _opencli_repo()
+    main_js = repo / "dist" / "src" / "main.js"
+    commander_pkg = repo / "node_modules" / "commander" / "package.json"
+    package_json = repo / "package.json"
+    node = shutil.which("node")
+    version_probe: Dict[str, Any] = {"ok": False, "error": "not run"}
+    if node and main_js.exists() and commander_pkg.exists():
+        try:
+            completed = subprocess.run(
+                [node, str(main_js), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=str(repo),
+                check=False,
+            )
+            version_probe = {
+                "ok": completed.returncode == 0,
+                "returncode": completed.returncode,
+                "stdout": completed.stdout.strip(),
+                "stderr": _clip_text(completed.stderr.strip(), 1000),
+            }
+        except Exception as exc:
+            version_probe = {"ok": False, "error": str(exc)}
+
+    missing: List[str] = []
+    if not node:
+        missing.append("node")
+    if not package_json.exists():
+        missing.append(str(package_json))
+    if not main_js.exists():
+        missing.append(str(main_js))
+    if not commander_pkg.exists():
+        missing.append(str(commander_pkg))
+    if version_probe.get("ok") is False and not missing:
+        missing.append("opencli --version")
+
+    return {
+        "ok": not missing and bool(version_probe.get("ok")),
+        "repo": str(repo),
+        "node": node,
+        "package_json_exists": package_json.exists(),
+        "main": str(main_js),
+        "main_exists": main_js.exists(),
+        "commander_package": str(commander_pkg),
+        "commander_exists": commander_pkg.exists(),
+        "version_probe": version_probe,
+        "missing": missing,
+        "repair_command": _runtime_repair_command(),
+    }
 
 
 def _hermes_management_config_path() -> Path:
@@ -316,13 +401,13 @@ def _configured_cdp_wait_seconds() -> float:
 
 
 def _local_opencli_command() -> Optional[List[str]]:
-    node = shutil.which("node")
+    runtime = _local_opencli_runtime_status()
+    if not runtime.get("ok"):
+        return None
+    node = runtime.get("node")
     if not node:
         return None
-    main_js = _repo_root() / "community-opencli" / "dist" / "src" / "main.js"
-    if main_js.exists():
-        return [node, str(main_js)]
-    return None
+    return [str(node), str(Path(str(runtime["main"])))]
 
 
 def _resolve_opencli_command() -> Optional[List[str]]:
@@ -334,9 +419,14 @@ def _resolve_opencli_command() -> Optional[List[str]]:
     if env_value:
         return shlex.split(env_value)
 
-    local = _local_opencli_command()
-    if local:
-        return local
+    local_runtime = _local_opencli_runtime_status()
+    if local_runtime.get("ok"):
+        node = local_runtime.get("node")
+        main = local_runtime.get("main")
+        if node and main:
+            return [str(node), str(main)]
+    if Path(str(local_runtime.get("repo") or "")).exists():
+        return None
 
     binary = shutil.which("opencli")
     if binary:
@@ -420,10 +510,19 @@ def _cdp_status(timeout: float = 1.5) -> Dict[str, Any]:
 def check_codex_requirements() -> bool:
     """Return True when Hermes can expose the Codex control tool.
 
-    CDP may be down precisely when the model needs ``ensure_cdp``. Do not hide
-    the whole toolset just because the recoverable runtime endpoint is absent.
+    CDP or repo-local OpenCLI dependencies may be down precisely when the model
+    needs a structured health/repair result. Do not hide the whole toolset
+    because a recoverable runtime dependency is absent.
     """
-    return bool(_resolve_opencli_command())
+    env_value = (
+        os.getenv("HERMES_CODEX_OPENCLI")
+        or os.getenv("HERMES_OPENCLI_BIN")
+        or ""
+    ).strip()
+    if env_value:
+        return True
+    runtime = _local_opencli_runtime_status()
+    return Path(str(runtime.get("repo") or "")).exists() or bool(shutil.which("opencli"))
 
 
 def _normalize_action(action: Any) -> str:
@@ -1014,6 +1113,7 @@ def _maybe_prepare_isolated_new_conversation_endpoint(
 
     ensure_args = {
         **args,
+        "allow_launch": True,
         "force_new": True,
         "timeout": max(15.0, min(_timeout_value(args), 30.0)),
     }
@@ -1175,9 +1275,38 @@ def _ensure_cdp_payload(args: Dict[str, Any]) -> Dict[str, Any]:
     timeout = _timeout_value(args)
     restart = _bool_value(args, "restart")
     force = _bool_value(args, "force")
+    allow_launch = _bool_value(args, "allow_launch") or restart
+    if not allow_launch:
+        return {
+            "ok": False,
+            "action": "ensure_cdp",
+            "source": "codex-cdp",
+            "status": "launch_not_allowed",
+            "error": (
+                "Codex App CDP is unavailable or force_new was requested, but "
+                "launching Codex is disabled by default."
+            ),
+            "launched": False,
+            "before": before,
+            "fallback_allowed": False,
+            "fallback": None,
+            "guidance": (
+                "Do not launch or restart Codex during routine status checks. "
+                "Retry with allow_launch=true only after explicit user "
+                "permission; use restart=true only when the user allows "
+                "quitting Codex."
+            ),
+            "next_actions": [
+                {"action": "health", "reason": "Report current read-only Codex/OpenCLI availability."},
+                {"action": "ensure_cdp", "reason": "Retry with allow_launch=true only after user permission."},
+            ],
+        }
+
     candidates = _codex_port_candidates(args)
     if force_new:
         candidates = _filter_existing_cdp_port(candidates, before)
+    if candidates:
+        candidates = candidates[:1]
     wait_seconds = _configured_cdp_wait_seconds()
     launches: List[Dict[str, Any]] = []
 
@@ -1228,49 +1357,62 @@ def _ensure_cdp_payload(args: Dict[str, Any]) -> Dict[str, Any]:
         "source": "codex-cdp",
         "status": "unavailable",
         "error": "Unable to launch a Codex CDP instance with an inspectable page target.",
+        "launched": bool(launches),
         "before": before,
         "quit": quit_result,
         "launches": launches,
         "fallback_allowed": False,
         "fallback": None,
         "guidance": (
-            "Run codex_opencli action='ensure_cdp' with restart=true if a stale "
-            "Codex process is holding the debug port, then retry state/status."
+            "Codex CDP recovery launched at most one candidate port and did "
+            "not find an inspectable page target. Retry with a specific port "
+            "or restart=true only when the user allows quitting Codex."
         ),
-        "next_actions": [{"action": "ensure_cdp", "reason": "Retry with restart=true if the user allows quitting Codex."}],
+        "next_actions": [{"action": "ensure_cdp", "reason": "Retry with restart=true only if the user allows quitting Codex."}],
     }
 
 
 def _health_payload() -> Dict[str, Any]:
+    runtime = _local_opencli_runtime_status()
     command = _resolve_opencli_command()
     cdp = _cdp_status()
     ok = bool(command) and bool(cdp.get("ok"))
     opencli_ok = bool(command)
     cdp_ok = bool(cdp.get("ok"))
+    local_runtime_required = Path(str(runtime.get("repo") or "")).exists() and not runtime.get("ok")
+    fallback_allowed = not opencli_ok and not local_runtime_required
+    if ok:
+        guidance = "Use codex_opencli actions for Codex App operations; do not use computer_use for ordinary Codex requests."
+        next_actions: List[Dict[str, Any]] = []
+    elif local_runtime_required:
+        guidance = (
+            "Repo-local OpenCLI runtime is incomplete. Repair the fixed "
+            "Hermes/OpenCLI environment before using Codex App controls."
+        )
+        next_actions = [{"action": "repair_runtime", "command": runtime.get("repair_command")}]
+    elif opencli_ok and not cdp_ok:
+        guidance = (
+            "Codex CDP is unavailable. Report this state during routine "
+            "checks; call action='ensure_cdp' with allow_launch=true only "
+            "after explicit user permission."
+        )
+        next_actions = [{"action": "ensure_cdp", "reason": "Recover CDP only with allow_launch=true after user permission."}]
+    else:
+        guidance = UNAVAILABLE_GUIDANCE
+        next_actions = []
     return {
         "ok": ok,
         "opencli": {
             "ok": opencli_ok,
             "command": _display_command(command) if command else None,
         },
+        "opencli_runtime": _clip_payload(runtime),
         "cdp": cdp,
         "preferred_over": "computer_use",
-        "fallback_allowed": not opencli_ok,
-        "fallback": "computer_use" if not opencli_ok else None,
-        "guidance": (
-            "Use codex_opencli actions for Codex App operations; do not use computer_use for ordinary Codex requests."
-            if ok
-            else (
-                "Call codex_opencli action='ensure_cdp' to launch a Codex CDP instance, then retry health/state."
-                if opencli_ok and not cdp_ok
-                else UNAVAILABLE_GUIDANCE
-            )
-        ),
-        "next_actions": (
-            [{"action": "ensure_cdp", "reason": "Launch or recover the Codex CDP page target."}]
-            if opencli_ok and not cdp_ok
-            else []
-        ),
+        "fallback_allowed": fallback_allowed,
+        "fallback": "computer_use" if fallback_allowed else None,
+        "guidance": guidance,
+        "next_actions": next_actions,
     }
 
 
@@ -1281,10 +1423,33 @@ def handle_codex_opencli(args: Dict[str, Any], **_kwargs: Any) -> str:
     if action == "ensure_cdp":
         return tool_result(_ensure_cdp_payload(args))
     effective_args, inferred_project = _with_inferred_codex_project(action, args)
+    runtime = _local_opencli_runtime_status()
+    has_opencli_override = bool((os.getenv("HERMES_CODEX_OPENCLI") or os.getenv("HERMES_OPENCLI_BIN") or "").strip())
+    if not runtime.get("ok") and not has_opencli_override:
+        return tool_error(
+            "Repo-local OpenCLI runtime is incomplete; repair the fixed Hermes/OpenCLI environment before using Codex App controls.",
+            ok=False,
+            action=action,
+            opencli_runtime=_clip_payload(runtime),
+            fallback_allowed=False,
+            fallback=None,
+            do_not_use_computer_use=True,
+            do_not_debug_adapter=True,
+            do_not_search_or_read_source=True,
+            guidance=(
+                "Use the hermes-management skill runtime repair entrypoint. "
+                "Do not install individual packages from a chat turn or switch "
+                "to naked terminal opencli commands."
+            ),
+            next_actions=[
+                {"action": "repair_runtime", "command": runtime.get("repair_command")},
+                {"action": "health", "reason": "Retry read-only health after the fixed runtime is repaired."},
+            ],
+        )
 
     auto_ensure_result: Optional[Dict[str, Any]] = None
     cdp = _cdp_status()
-    if not cdp.get("ok") and action in HIGH_LEVEL_ACTIONS and _bool_value(effective_args, "auto_ensure_cdp", True):
+    if not cdp.get("ok") and action in HIGH_LEVEL_ACTIONS and _bool_value(effective_args, "auto_ensure_cdp", False):
         auto_ensure_result = _ensure_cdp_payload(effective_args)
         if auto_ensure_result.get("ok"):
             cdp = auto_ensure_result.get("cdp") if isinstance(auto_ensure_result.get("cdp"), dict) else _cdp_status()
@@ -1297,7 +1462,7 @@ def handle_codex_opencli(args: Dict[str, Any], **_kwargs: Any) -> str:
             )
         else:
             next_actions = [
-                {"action": "ensure_cdp", "reason": "Launch or recover a Codex CDP instance with an inspectable page target."},
+                {"action": "ensure_cdp", "reason": "Recover CDP only with allow_launch=true after user permission."},
                 {"action": action, "reason": "Retry the original Codex operation after ensure_cdp succeeds."},
             ]
             if isinstance(auto_ensure_result, dict) and auto_ensure_result.get("next_actions"):
@@ -1314,17 +1479,16 @@ def handle_codex_opencli(args: Dict[str, Any], **_kwargs: Any) -> str:
                 do_not_debug_adapter=True,
                 do_not_search_or_read_source=True,
                 guidance=(
-                    "codex_opencli tried to launch a CDP-enabled Codex instance "
-                    "automatically. If this failed because an existing Codex "
-                    "process is stale, retry action='ensure_cdp' with "
-                    "restart=true only when the user allows quitting Codex."
+                    "Automatic CDP recovery is non-mutating unless "
+                    "allow_launch=true or restart=true is explicitly provided. "
+                    "Do not launch or restart Codex during routine status checks."
                 ),
                 next_actions=next_actions,
             )
 
     if not cdp.get("ok"):
         return tool_error(
-            "Codex App CDP is unavailable or has no inspectable page target; run codex_opencli action='ensure_cdp' before retrying this Codex operation.",
+            "Codex App CDP is unavailable or has no inspectable page target; routine checks must report this instead of launching Codex.",
             ok=False,
             action=action,
             cdp=cdp,
@@ -1334,13 +1498,14 @@ def handle_codex_opencli(args: Dict[str, Any], **_kwargs: Any) -> str:
             do_not_debug_adapter=True,
             do_not_search_or_read_source=True,
             guidance=(
-                "Call codex_opencli with action='ensure_cdp' to launch a "
-                "CDP-enabled Codex instance, then retry the requested action. "
-                "Only use computer_use after ensure_cdp fails or a user-visible "
-                "permission/system dialog must be handled."
+                "Use health/status for read-only reporting. Retry "
+                "action='ensure_cdp' with allow_launch=true only after explicit "
+                "user permission; use restart=true only when the user allows "
+                "quitting Codex."
             ),
             next_actions=[
-                {"action": "ensure_cdp", "reason": "Launch or recover a Codex CDP instance with an inspectable page target."},
+                {"action": "health", "reason": "Report current read-only Codex/OpenCLI availability."},
+                {"action": "ensure_cdp", "reason": "Recover CDP only with allow_launch=true after user permission."},
                 {"action": action, "reason": "Retry the original Codex operation after ensure_cdp succeeds."},
             ],
         )

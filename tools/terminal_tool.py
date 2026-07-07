@@ -37,6 +37,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -261,6 +262,203 @@ def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback())
+
+
+_APP_OPERATOR_TOOL_MODULES = {
+    "codex_opencli": ("tools.codex_tool", "handle_codex_opencli"),
+    "claude_app_opencli": ("tools.claude_app_tool", "handle_claude_app_opencli"),
+    "antigravity_opencli": ("tools.antigravity_tool", "handle_antigravity_opencli"),
+    "antigravity_ide_opencli": ("tools.antigravity_ide_tool", "handle_antigravity_ide_opencli"),
+}
+
+_APP_OPERATOR_SITES = {
+    "codex": "codex_opencli",
+    "claude": "claude_app_opencli",
+    "claude-app": "claude_app_opencli",
+    "antigravity": "antigravity_opencli",
+}
+
+_APP_OPERATOR_ACTION_ALIASES = {
+    "ensure-cdp": "ensure_cdp",
+    "open": "open_conversation",
+    "extract-diff": "extract_diff",
+}
+
+_APP_OPERATOR_ACTIONS = {
+    "archive",
+    "ask",
+    "conversations",
+    "dump",
+    "ensure_cdp",
+    "export",
+    "extract_diff",
+    "health",
+    "history",
+    "model",
+    "models",
+    "new",
+    "open_conversation",
+    "pin",
+    "projects",
+    "read",
+    "rename",
+    "screenshot",
+    "send",
+    "state",
+    "status",
+    "stop",
+    "wait",
+}
+
+
+def _split_shell_words(command: str) -> List[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.strip().split()
+
+
+def _word_basename(word: str) -> str:
+    return Path(word).name.strip().lower()
+
+
+def _normalize_app_operator_action(value: str) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return _APP_OPERATOR_ACTION_ALIASES.get(normalized, normalized)
+
+
+def _extract_app_operator_shell_invocation(command: str) -> Optional[tuple[str, str]]:
+    """Return the dedicated app-operator tool/action for shell invocations.
+
+    Hermes app operators are structured tools, not terminal commands. This
+    catches direct tool names, naked global OpenCLI, npx/bun wrappers, and the
+    repo-local ``node .../dist/src/main.js <site>`` form that OpenCLI emits in
+    structured results.
+    """
+    words = _split_shell_words(command)
+    if not words:
+        return None
+
+    def action_after(index: int) -> str:
+        for item in words[index + 1:]:
+            if item.startswith("-") or "=" in item:
+                continue
+            action = _normalize_app_operator_action(item)
+            if action in _APP_OPERATOR_ACTIONS:
+                return action
+        return "status"
+
+    for index, word in enumerate(words):
+        name = _word_basename(word)
+        if name in _APP_OPERATOR_TOOL_MODULES:
+            return name, action_after(index)
+
+        if name in {"opencli", "opencli.js"}:
+            if index + 1 < len(words):
+                site = _word_basename(words[index + 1])
+                tool_name = _APP_OPERATOR_SITES.get(site)
+                if tool_name:
+                    return tool_name, action_after(index + 1)
+
+        if name in {"npx", "pnpm", "yarn", "bunx"} and index + 2 < len(words):
+            maybe_opencli = _word_basename(words[index + 1])
+            site = _word_basename(words[index + 2])
+            tool_name = _APP_OPERATOR_SITES.get(site)
+            if maybe_opencli in {"opencli", "@jackwener/opencli"} and tool_name:
+                return tool_name, action_after(index + 2)
+
+        if name in {"node", "bun", "tsx"} and index + 2 < len(words):
+            script = words[index + 1].lower()
+            if script.endswith("/dist/src/main.js") or script.endswith("dist/src/main.js"):
+                site = _word_basename(words[index + 2])
+                tool_name = _APP_OPERATOR_SITES.get(site)
+                if tool_name:
+                    return tool_name, action_after(index + 2)
+
+        if name == "bash" and index + 2 < len(words):
+            script_name = _word_basename(words[index + 1])
+            wrapper_tool = {
+                "codex-opencli.sh": "codex_opencli",
+                "claude-app-opencli.sh": "claude_app_opencli",
+                "antigravity-opencli.sh": "antigravity_opencli",
+            }.get(script_name)
+            if wrapper_tool:
+                return wrapper_tool, action_after(index + 1)
+
+    return None
+
+
+def _codex_process_mutation_block(command: str) -> Optional[Dict[str, Any]]:
+    """Block terminal commands that can quit or relaunch the user's Codex app."""
+    compact = " ".join(command.lower().split())
+    if "codex" not in compact and "com.openai.codex" not in compact:
+        return None
+
+    mutates_codex = (
+        "tell application \"codex\" to quit" in compact
+        or "tell app \"codex\" to quit" in compact
+        or re.search(r"\b(?:pkill|killall)\b[^;&|]*\bcodex\b", compact) is not None
+        or re.search(r"\b(?:pkill|killall)\b[^;&|]*\bcom\.openai\.codex\b", compact) is not None
+        or ("--remote-debugging-port" in compact and (
+            re.search(r"\bopen\b[^;&|]*(?:-a\s+['\"]?codex['\"]?|codex\.app)", compact) is not None
+            or "/applications/codex.app/contents/macos/codex" in compact
+        ))
+    )
+    if not mutates_codex:
+        return None
+
+    return {
+        "output": "",
+        "exit_code": -1,
+        "error": (
+            "BLOCKED: terminal command would quit or relaunch Codex App. "
+            "Do not restart Codex from Hermes/terminal because it can stop the "
+            "user's active task. Use the dedicated codex_opencli tool with "
+            "{\"action\":\"health\"}, {\"action\":\"state\"}, or "
+            "{\"action\":\"ensure_cdp\"} first. Only use restart=true after "
+            "explicit user permission."
+        ),
+        "status": "blocked",
+    }
+
+
+def _redirect_app_operator_terminal_invocation(
+    command: str,
+    tool_name: str,
+    action: str,
+) -> str:
+    logger.info(
+        "terminal auto-redirect: %s -> %s action=%s",
+        command[:120], tool_name, action)
+    try:
+        mod_name, fn_name = _APP_OPERATOR_TOOL_MODULES[tool_name]
+        mod = importlib.import_module(mod_name)
+        handler = getattr(mod, fn_name)
+        redirected_result = handler({"action": action})
+        note = (
+            f"[Auto-redirected from terminal] The command "
+            f"``{command.strip()[:80]}`` was intercepted "
+            f"and executed as ``{tool_name}`` action=\"{action}\". "
+            f"Do NOT run app operator tools as shell commands.\n\n"
+        )
+        if isinstance(redirected_result, str):
+            return note + redirected_result
+        return note + json.dumps(redirected_result, ensure_ascii=False)
+    except Exception as exc:
+        logger.warning(
+            "terminal auto-redirect failed for %s: %s",
+            tool_name, exc)
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": (
+                f"BLOCKED: ``{tool_name}`` is NOT a shell command. "
+                f"It is a Hermes tool. STOP using terminal. Instead, make a "
+                f"tool call to ``{tool_name}`` with these exact arguments: "
+                f"{{\"action\": \"{action}\"}}"
+            ),
+            "status": "blocked",
+        }, ensure_ascii=False)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -1966,6 +2164,19 @@ def terminal_tool(
             # Block app operator shell commands — the model is trying to run
             # a dedicated Hermes tool as a shell command.  Return a clear
             # error so the model calls the proper tool instead.
+            _codex_process_block = _codex_process_mutation_block(command)
+            if _codex_process_block:
+                logger.warning(
+                    "Blocked Codex process mutation through terminal: %s",
+                    _safe_command_preview(command),
+                )
+                return json.dumps(_codex_process_block, ensure_ascii=False)
+
+            _app_operator_redirect = _extract_app_operator_shell_invocation(command)
+            if _app_operator_redirect:
+                _tool_name, _action = _app_operator_redirect
+                return _redirect_app_operator_terminal_invocation(command, _tool_name, _action)
+
             _cmd_head = command.strip().split()[0] if command.strip() else ""
             _cmd_lower = command.lower()
             _app_op_shell_patterns = {

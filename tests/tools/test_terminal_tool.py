@@ -168,3 +168,51 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_extract_app_operator_shell_invocation_detects_node_opencli_codex():
+    command = (
+        "node /Users/zjah/Documents/code/zhangjian-skills/repos/community-opencli/"
+        "dist/src/main.js codex status --format json"
+    )
+
+    assert terminal_tool._extract_app_operator_shell_invocation(command) == (
+        "codex_opencli",
+        "status",
+    )
+
+
+def test_extract_app_operator_shell_invocation_normalizes_codex_ensure_cdp():
+    command = (
+        "node /Users/zjah/Documents/code/zhangjian-skills/repos/community-opencli/"
+        "dist/src/main.js codex ensure-cdp --restart --port 9238"
+    )
+
+    assert terminal_tool._extract_app_operator_shell_invocation(command) == (
+        "codex_opencli",
+        "ensure_cdp",
+    )
+
+
+def test_codex_process_mutation_block_rejects_remote_debug_open():
+    result = terminal_tool._codex_process_mutation_block(
+        'open -n -a "Codex" --args --remote-debugging-port=9238'
+    )
+
+    assert result is not None
+    assert result["status"] == "blocked"
+    assert "would quit or relaunch Codex App" in result["error"]
+
+
+def test_codex_process_mutation_block_rejects_quit_and_kill():
+    quit_result = terminal_tool._codex_process_mutation_block(
+        'osascript -e \'tell application "Codex" to quit\''
+    )
+    kill_result = terminal_tool._codex_process_mutation_block(
+        "pkill -TERM -f /Applications/Codex.app/Contents/MacOS/Codex"
+    )
+
+    assert quit_result is not None
+    assert quit_result["status"] == "blocked"
+    assert kill_result is not None
+    assert kill_result["status"] == "blocked"
